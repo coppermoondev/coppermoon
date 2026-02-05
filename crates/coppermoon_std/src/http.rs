@@ -6,7 +6,23 @@ use coppermoon_core::Result;
 use mlua::{Lua, Table};
 use std::time::Duration;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+// ---------------------------------------------------------------------------
+// Global connection-pooled HTTP client
+// ---------------------------------------------------------------------------
+
+static GLOBAL_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+fn global_client() -> &'static reqwest::blocking::Client {
+    GLOBAL_CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("Failed to create global HTTP client")
+    })
+}
 
 /// Register the http module
 pub fn register(lua: &Lua) -> Result<Table> {
@@ -141,16 +157,29 @@ fn build_response(lua: &Lua, response: reqwest::blocking::Response) -> mlua::Res
     Ok(result)
 }
 
-fn create_client(options: &RequestOptions) -> mlua::Result<reqwest::blocking::Client> {
-    let mut builder = reqwest::blocking::Client::builder()
-        .cookie_store(true);
+fn build_request(
+    client: &reqwest::blocking::Client,
+    method: reqwest::Method,
+    url: &str,
+    opts: &RequestOptions,
+) -> reqwest::blocking::RequestBuilder {
+    let mut request = client.request(method, url);
 
-    if let Some(timeout) = options.timeout {
-        builder = builder.timeout(timeout);
+    if let Some(timeout) = opts.timeout {
+        request = request.timeout(timeout);
     }
 
-    builder.build()
-        .map_err(|e| mlua::Error::runtime(format!("Failed to create HTTP client: {}", e)))
+    for (key, value) in &opts.headers {
+        request = request.header(key, value);
+    }
+
+    request = apply_cookies(request, &opts.cookies);
+
+    if let Some(body) = &opts.body {
+        request = request.body(body.clone());
+    }
+
+    request
 }
 
 fn apply_cookies(request: reqwest::blocking::RequestBuilder, cookies: &HashMap<String, String>) -> reqwest::blocking::RequestBuilder {
@@ -167,19 +196,14 @@ fn apply_cookies(request: reqwest::blocking::RequestBuilder, cookies: &HashMap<S
     request.header("Cookie", cookie_header)
 }
 
-fn http_get(lua: &Lua, (url, options): (String, Option<Table>)) -> mlua::Result<Table> {
-    let opts = options.map(|t| RequestOptions::from_table(&t))
-        .transpose()?
-        .unwrap_or_else(RequestOptions::empty);
-
-    let client = create_client(&opts)?;
-    let mut request = client.get(&url);
-
-    for (key, value) in &opts.headers {
-        request = request.header(key, value);
-    }
-
-    request = apply_cookies(request, &opts.cookies);
+fn send_request(
+    lua: &Lua,
+    method: reqwest::Method,
+    url: &str,
+    opts: RequestOptions,
+) -> mlua::Result<Table> {
+    let client = global_client();
+    let request = build_request(client, method, url, &opts);
 
     let response = coppermoon_core::block_on(async {
         tokio::task::spawn_blocking(move || request.send())
@@ -189,6 +213,14 @@ fn http_get(lua: &Lua, (url, options): (String, Option<Table>)) -> mlua::Result<
     })?;
 
     build_response(lua, response)
+}
+
+fn http_get(lua: &Lua, (url, options): (String, Option<Table>)) -> mlua::Result<Table> {
+    let opts = options.map(|t| RequestOptions::from_table(&t))
+        .transpose()?
+        .unwrap_or_else(RequestOptions::empty);
+
+    send_request(lua, reqwest::Method::GET, &url, opts)
 }
 
 fn http_post(lua: &Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
@@ -200,27 +232,7 @@ fn http_post(lua: &Lua, (url, body, options): (String, Option<String>, Option<Ta
         opts.body = Some(b);
     }
 
-    let client = create_client(&opts)?;
-    let mut request = client.post(&url);
-
-    for (key, value) in &opts.headers {
-        request = request.header(key, value);
-    }
-
-    request = apply_cookies(request, &opts.cookies);
-
-    if let Some(body) = &opts.body {
-        request = request.body(body.clone());
-    }
-
-    let response = coppermoon_core::block_on(async {
-        tokio::task::spawn_blocking(move || request.send())
-            .await
-            .map_err(|e| mlua::Error::runtime(format!("Task join error: {}", e)))?
-            .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))
-    })?;
-
-    build_response(lua, response)
+    send_request(lua, reqwest::Method::POST, &url, opts)
 }
 
 fn http_put(lua: &Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
@@ -232,27 +244,7 @@ fn http_put(lua: &Lua, (url, body, options): (String, Option<String>, Option<Tab
         opts.body = Some(b);
     }
 
-    let client = create_client(&opts)?;
-    let mut request = client.put(&url);
-
-    for (key, value) in &opts.headers {
-        request = request.header(key, value);
-    }
-
-    request = apply_cookies(request, &opts.cookies);
-
-    if let Some(body) = &opts.body {
-        request = request.body(body.clone());
-    }
-
-    let response = coppermoon_core::block_on(async {
-        tokio::task::spawn_blocking(move || request.send())
-            .await
-            .map_err(|e| mlua::Error::runtime(format!("Task join error: {}", e)))?
-            .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))
-    })?;
-
-    build_response(lua, response)
+    send_request(lua, reqwest::Method::PUT, &url, opts)
 }
 
 fn http_delete(lua: &Lua, (url, options): (String, Option<Table>)) -> mlua::Result<Table> {
@@ -260,23 +252,7 @@ fn http_delete(lua: &Lua, (url, options): (String, Option<Table>)) -> mlua::Resu
         .transpose()?
         .unwrap_or_else(RequestOptions::empty);
 
-    let client = create_client(&opts)?;
-    let mut request = client.delete(&url);
-
-    for (key, value) in &opts.headers {
-        request = request.header(key, value);
-    }
-
-    request = apply_cookies(request, &opts.cookies);
-
-    let response = coppermoon_core::block_on(async {
-        tokio::task::spawn_blocking(move || request.send())
-            .await
-            .map_err(|e| mlua::Error::runtime(format!("Task join error: {}", e)))?
-            .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))
-    })?;
-
-    build_response(lua, response)
+    send_request(lua, reqwest::Method::DELETE, &url, opts)
 }
 
 fn http_patch(lua: &Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
@@ -288,67 +264,28 @@ fn http_patch(lua: &Lua, (url, body, options): (String, Option<String>, Option<T
         opts.body = Some(b);
     }
 
-    let client = create_client(&opts)?;
-    let mut request = client.patch(&url);
-
-    for (key, value) in &opts.headers {
-        request = request.header(key, value);
-    }
-
-    request = apply_cookies(request, &opts.cookies);
-
-    if let Some(body) = &opts.body {
-        request = request.body(body.clone());
-    }
-
-    let response = coppermoon_core::block_on(async {
-        tokio::task::spawn_blocking(move || request.send())
-            .await
-            .map_err(|e| mlua::Error::runtime(format!("Task join error: {}", e)))?
-            .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))
-    })?;
-
-    build_response(lua, response)
+    send_request(lua, reqwest::Method::PATCH, &url, opts)
 }
 
 fn http_request(lua: &Lua, options: Table) -> mlua::Result<Table> {
-    let method: String = options.get("method")
+    let method_str: String = options.get("method")
         .unwrap_or_else(|_| "GET".to_string());
     let url: String = options.get("url")
         .map_err(|_| mlua::Error::runtime("Missing 'url' in request options"))?;
 
-    let opts = RequestOptions::from_table(&options)?;
-    let client = create_client(&opts)?;
-
-    let mut request = match method.to_uppercase().as_str() {
-        "GET" => client.get(&url),
-        "POST" => client.post(&url),
-        "PUT" => client.put(&url),
-        "DELETE" => client.delete(&url),
-        "PATCH" => client.patch(&url),
-        "HEAD" => client.head(&url),
-        "OPTIONS" => client.request(reqwest::Method::OPTIONS, &url),
-        _ => return Err(mlua::Error::runtime(format!("Unsupported HTTP method: {}", method))),
+    let method = match method_str.to_uppercase().as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        _ => return Err(mlua::Error::runtime(format!("Unsupported HTTP method: {}", method_str))),
     };
 
-    for (key, value) in &opts.headers {
-        request = request.header(key, value);
-    }
-
-    request = apply_cookies(request, &opts.cookies);
-
-    if let Some(body) = &opts.body {
-        request = request.body(body.clone());
-    }
-
-    let response = coppermoon_core::block_on(async {
-        tokio::task::spawn_blocking(move || request.send())
-            .await
-            .map_err(|e| mlua::Error::runtime(format!("Task join error: {}", e)))?
-            .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))
-    })?;
-
-    build_response(lua, response)
+    let opts = RequestOptions::from_table(&options)?;
+    send_request(lua, method, &url, opts)
 }
 
 // HTTP Session with persistent cookies
@@ -418,40 +355,33 @@ fn session_request(
     body: Option<String>,
     options: Option<Table>,
 ) -> mlua::Result<Table> {
-    let opts = options.map(|t| RequestOptions::from_table(&t))
+    let mut opts = options.map(|t| RequestOptions::from_table(&t))
         .transpose()?
         .unwrap_or_else(RequestOptions::empty);
 
-    // Get session cookies
+    // Merge session cookies into opts
     let session_cookies = session.cookies.lock()
         .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?
         .clone();
-
-    // Merge cookies
-    let mut all_cookies = session_cookies;
-    for (k, v) in opts.cookies {
-        all_cookies.insert(k, v);
+    for (k, v) in session_cookies {
+        opts.cookies.entry(k).or_insert(v);
     }
 
-    let client = session.client.clone();
-    let mut request = match method {
-        "GET" => client.get(&url),
-        "POST" => client.post(&url),
-        "PUT" => client.put(&url),
-        "DELETE" => client.delete(&url),
-        "PATCH" => client.patch(&url),
+    if let Some(b) = body {
+        opts.body = Some(b);
+    }
+
+    let req_method = match method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
         _ => return Err(mlua::Error::runtime(format!("Unsupported method: {}", method))),
     };
 
-    for (key, value) in &opts.headers {
-        request = request.header(key, value);
-    }
-
-    request = apply_cookies(request, &all_cookies);
-
-    if let Some(b) = body.or(opts.body) {
-        request = request.body(b);
-    }
+    let client = &*session.client;
+    let request = build_request(client, req_method, &url, &opts);
 
     let response = coppermoon_core::block_on(async {
         tokio::task::spawn_blocking(move || request.send())

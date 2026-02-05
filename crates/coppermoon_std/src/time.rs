@@ -3,10 +3,11 @@
 //! Provides time-related utilities including sleep, timers, and time measurement.
 
 use coppermoon_core::Result;
+use coppermoon_core::event_loop::{
+    self, TimerCallback, TimerType,
+};
 use mlua::{Lua, Table, Function};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use chrono::{DateTime, Utc, NaiveDateTime};
 
 /// Register the time module
@@ -143,57 +144,53 @@ fn time_parse(_: &Lua, (time_str, format): (String, Option<String>)) -> mlua::Re
     Err(mlua::Error::runtime(format!("Cannot parse time string: '{}'", time_str)))
 }
 
-// Timer management
-static TIMER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-static CANCELLED_TIMERS: std::sync::OnceLock<Mutex<std::collections::HashSet<u64>>> = std::sync::OnceLock::new();
-
-fn get_cancelled_timers() -> &'static Mutex<std::collections::HashSet<u64>> {
-    CANCELLED_TIMERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
+// ---------------------------------------------------------------------------
+// setTimeout / setInterval / clearTimeout
+// ---------------------------------------------------------------------------
 
 fn set_timeout(lua: &Lua, (callback, ms): (Function, u64)) -> mlua::Result<u64> {
-    let timer_id = TIMER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let timer_id = event_loop::next_timer_id();
 
-    // Store callback in registry (for future use when we implement proper callback execution)
-    let _callback_key = lua.create_registry_value(callback)?;
+    // Store callback in the Lua registry so it stays alive
+    let registry_key = lua.create_registry_value(callback)?;
 
-    // Spawn a thread to execute the callback after delay
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(ms));
+    // Register with the global event loop infrastructure
+    event_loop::register_timer(timer_id, TimerCallback {
+        registry_key,
+        timer_type: TimerType::Timeout,
+    });
 
-        // Check if timer was cancelled
-        if let Ok(cancelled) = get_cancelled_timers().lock() {
-            if cancelled.contains(&timer_id) {
-                return;
-            }
+    // Spawn a Tokio task that sleeps then signals readiness
+    coppermoon_core::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        if !event_loop::is_timer_cancelled(timer_id) {
+            event_loop::send_timer_ready(timer_id);
         }
-
-        // Note: In a real implementation, we'd need to safely call back into Lua
-        // This is a simplified version - full implementation would need message passing
     });
 
     Ok(timer_id)
 }
 
 fn set_interval(lua: &Lua, (callback, ms): (Function, u64)) -> mlua::Result<u64> {
-    let timer_id = TIMER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let timer_id = event_loop::next_timer_id();
 
-    // Store callback in registry (for future use)
-    let _callback_key = lua.create_registry_value(callback)?;
+    // Store callback in the Lua registry
+    let registry_key = lua.create_registry_value(callback)?;
 
-    // Spawn a thread for interval
-    std::thread::spawn(move || {
+    // Register with the global event loop infrastructure
+    event_loop::register_timer(timer_id, TimerCallback {
+        registry_key,
+        timer_type: TimerType::Interval { ms },
+    });
+
+    // Spawn a Tokio task that repeatedly sleeps and signals
+    coppermoon_core::spawn(async move {
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-
-            // Check if timer was cancelled
-            if let Ok(cancelled) = get_cancelled_timers().lock() {
-                if cancelled.contains(&timer_id) {
-                    break;
-                }
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            if event_loop::is_timer_cancelled(timer_id) {
+                break;
             }
-
-            // Note: Same limitation as setTimeout
+            event_loop::send_timer_ready(timer_id);
         }
     });
 
@@ -201,8 +198,6 @@ fn set_interval(lua: &Lua, (callback, ms): (Function, u64)) -> mlua::Result<u64>
 }
 
 fn clear_timeout(_: &Lua, timer_id: u64) -> mlua::Result<()> {
-    if let Ok(mut cancelled) = get_cancelled_timers().lock() {
-        cancelled.insert(timer_id);
-    }
+    event_loop::cancel_timer(timer_id);
     Ok(())
 }

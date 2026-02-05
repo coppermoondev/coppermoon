@@ -18,6 +18,7 @@ coppermoon_core = { path = "../coppermoon_core" }
 coppermoon_std = { path = "../coppermoon_std" }
 coppermoon_sqlite = { path = "../sqlite" }
 coppermoon_mysql = { path = "../mysql" }
+coppermoon_postgresql = { path = "../postgresql" }
 mlua.workspace = true
 tokio.workspace = true
 clap.workspace = true

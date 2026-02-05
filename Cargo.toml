@@ -4,10 +4,11 @@ members = [
     "crates/coppermoon",
     "crates/coppermoon_core",
     "crates/coppermoon_std",
-    # "crates/harbor",     # Separate repo: github.com/coppermoondev/harbor
-    # "crates/shipyard",   # Separate repo: github.com/coppermoondev/shipyard
+    "crates/harbor",
+    "crates/shipyard",
     "crates/sqlite",
     "crates/mysql",
+    "crates/postgresql",
 ]
 
 [workspace.package]

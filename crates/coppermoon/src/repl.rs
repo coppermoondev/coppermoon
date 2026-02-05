@@ -20,6 +20,7 @@ pub fn start() -> Result<()> {
     coppermoon_std::register_all(runtime.lua())?;
     coppermoon_sqlite::register_global(runtime.lua())?;
     coppermoon_mysql::register_global(runtime.lua())?;
+    coppermoon_postgresql::register_global(runtime.lua())?;
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();

@@ -1,8 +1,10 @@
 //! Lua runtime management
 
-use crate::{Error, Result};
-use mlua::{Lua, MultiValue, Value, StdLib};
+use crate::{Error, Result, event_loop};
+use crate::event_loop::{TimerEvent, TimerType};
+use mlua::{Lua, Function, MultiValue, Value, StdLib};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{debug, info};
 
 /// The CopperMoon Lua runtime
@@ -50,6 +52,7 @@ impl Runtime {
     /// Execute a Lua script from a string
     pub fn exec(&self, code: &str) -> Result<()> {
         self.lua.load(code).exec()?;
+        self.run_event_loop()?;
         Ok(())
     }
 
@@ -92,6 +95,39 @@ impl Runtime {
 
         chunk.exec()?;
 
+        // Process pending timer callbacks (setTimeout, setInterval)
+        self.run_event_loop()?;
+
+        Ok(())
+    }
+
+    /// Run the event loop to drain pending timer callbacks.
+    ///
+    /// This keeps the process alive as long as there are pending timers,
+    /// similar to how Node.js keeps running while timers are active.
+    pub fn run_event_loop(&self) -> Result<()> {
+        while event_loop::has_pending_timers() {
+            match event_loop::try_recv_timer_event(Duration::from_millis(50)) {
+                Some(TimerEvent::Ready(id)) => {
+                    if let Some(cb) = event_loop::take_timer_callback(id) {
+                        let func: Function = self.lua.registry_value(&cb.registry_key)?;
+                        if let Err(e) = func.call::<()>(()) {
+                            eprintln!("Timer callback error: {}", e);
+                        }
+                        match cb.timer_type {
+                            TimerType::Timeout => {
+                                self.lua.remove_registry_value(cb.registry_key)?;
+                            }
+                            TimerType::Interval { .. } => {
+                                // Put the callback back for the next invocation
+                                event_loop::restore_timer_callback(id, cb);
+                            }
+                        }
+                    }
+                }
+                None => continue,
+            }
+        }
         Ok(())
     }
 

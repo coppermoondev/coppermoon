@@ -127,6 +127,7 @@ print(response.body)
 |--------|-------------|
 | `sqlite` | SQLite (file and in-memory) |
 | `mysql` | MySQL / MariaDB |
+| `postgresql` | PostgreSQL |
 
 ---
 
@@ -278,7 +279,7 @@ Logger, CORS, body parsers (JSON, URL-encoded), static files, rate limiting, aut
 ### 🔨 Phase 8 — Native Services
 - [x] SQLite bindings
 - [x] MySQL bindings
-- [ ] PostgreSQL bindings
+- [x] PostgreSQL bindings
 - [x] Redis client
 - [x] MQTT client
 - [x] S3 client
@@ -318,7 +319,8 @@ coppermoon/
 │   ├── harbor/            # Package manager
 │   ├── shipyard/          # Project toolchain
 │   ├── sqlite/            # SQLite bindings
-│   └── mysql/             # MySQL bindings
+│   ├── mysql/             # MySQL bindings
+│   └── postgresql/        # PostgreSQL bindings
 ├── packages/
 │   ├── honeymoon/         # Web framework
 │   ├── freight/           # ORM

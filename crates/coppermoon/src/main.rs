@@ -73,6 +73,9 @@ fn run_file(file: &str, args: Vec<String>) -> Result<()> {
     // Register MySQL module
     coppermoon_mysql::register_global(runtime.lua())?;
 
+    // Register PostgreSQL module
+    coppermoon_postgresql::register_global(runtime.lua())?;
+
     // Set script arguments
     let lua = runtime.lua();
     let arg_table = lua.create_table()?;

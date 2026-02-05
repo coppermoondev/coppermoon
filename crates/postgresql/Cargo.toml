@@ -1,0 +1,12 @@
+[package]
+name = "coppermoon_postgresql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "PostgreSQL bindings for CopperMoon Lua runtime"
+
+[dependencies]
+mlua.workspace = true
+thiserror.workspace = true
+postgres = "0.19"

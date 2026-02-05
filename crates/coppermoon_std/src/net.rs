@@ -1,6 +1,8 @@
 //! Network module for CopperMoon
 //!
 //! Provides low-level TCP and UDP networking capabilities.
+//! Blocking I/O is offloaded to Tokio's blocking thread pool via
+//! `spawn_blocking` so it doesn't interfere with async workers.
 
 use coppermoon_core::Result;
 use mlua::{Lua, Table, UserData, UserDataMethods};
@@ -8,6 +10,19 @@ use std::io::{Read, Write, BufReader, BufRead};
 use std::net::{TcpStream, TcpListener, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Helper: run a blocking closure on Tokio's thread pool and wait for the result.
+fn spawn_blocking<F, T>(f: F) -> std::result::Result<T, mlua::Error>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    coppermoon_core::block_on(async {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| mlua::Error::runtime(format!("Task join error: {}", e)))
+    })
+}
 
 /// Register the net module
 pub fn register(lua: &Lua) -> Result<Table> {
@@ -40,87 +55,96 @@ impl UserData for TcpConnection {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         // conn:read(n) -> string
         methods.add_method("read", |lua, this, n: Option<usize>| {
-            let mut stream = this.stream.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
+            let stream = Arc::clone(&this.stream);
             let n = n.unwrap_or(4096);
-            let mut buffer = vec![0u8; n];
-            let bytes_read = stream.read(&mut buffer)
-                .map_err(|e| mlua::Error::runtime(format!("Read error: {}", e)))?;
-
-            buffer.truncate(bytes_read);
-            lua.create_string(&buffer)
+            let bytes = spawn_blocking(move || {
+                let mut stream = stream.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                let mut buffer = vec![0u8; n];
+                let bytes_read = stream.read(&mut buffer)
+                    .map_err(|e| mlua::Error::runtime(format!("Read error: {}", e)))?;
+                buffer.truncate(bytes_read);
+                Ok::<Vec<u8>, mlua::Error>(buffer)
+            })??;
+            lua.create_string(&bytes)
         });
 
         // conn:read_line() -> string
         methods.add_method("read_line", |_lua, this, _: ()| {
-            let stream = this.stream.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
-            let mut reader = BufReader::new(&*stream);
-            let mut line = String::new();
-            reader.read_line(&mut line)
-                .map_err(|e| mlua::Error::runtime(format!("Read error: {}", e)))?;
-
-            Ok(line)
+            let stream = Arc::clone(&this.stream);
+            spawn_blocking(move || {
+                let stream = stream.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                let mut reader = BufReader::new(&*stream);
+                let mut line = String::new();
+                reader.read_line(&mut line)
+                    .map_err(|e| mlua::Error::runtime(format!("Read error: {}", e)))?;
+                Ok::<String, mlua::Error>(line)
+            })?
         });
 
         // conn:read_all() -> string
         methods.add_method("read_all", |lua, this, _: ()| {
-            let mut stream = this.stream.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
-            let mut buffer = Vec::new();
-            stream.read_to_end(&mut buffer)
-                .map_err(|e| mlua::Error::runtime(format!("Read error: {}", e)))?;
-
-            lua.create_string(&buffer)
+            let stream = Arc::clone(&this.stream);
+            let bytes = spawn_blocking(move || {
+                let mut stream = stream.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                let mut buffer = Vec::new();
+                stream.read_to_end(&mut buffer)
+                    .map_err(|e| mlua::Error::runtime(format!("Read error: {}", e)))?;
+                Ok::<Vec<u8>, mlua::Error>(buffer)
+            })??;
+            lua.create_string(&bytes)
         });
 
         // conn:write(data) -> bytes_written
         methods.add_method("write", |_, this, data: mlua::String| {
-            let mut stream = this.stream.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
+            let stream = Arc::clone(&this.stream);
             let bytes: Vec<u8> = data.as_bytes().to_vec();
-            let written = stream.write(&bytes)
-                .map_err(|e| mlua::Error::runtime(format!("Write error: {}", e)))?;
-
-            Ok(written)
+            spawn_blocking(move || {
+                let mut stream = stream.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                let written = stream.write(&bytes)
+                    .map_err(|e| mlua::Error::runtime(format!("Write error: {}", e)))?;
+                Ok::<usize, mlua::Error>(written)
+            })?
         });
 
         // conn:write_all(data)
         methods.add_method("write_all", |_, this, data: mlua::String| {
-            let mut stream = this.stream.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
+            let stream = Arc::clone(&this.stream);
             let bytes: Vec<u8> = data.as_bytes().to_vec();
-            stream.write_all(&bytes)
-                .map_err(|e| mlua::Error::runtime(format!("Write error: {}", e)))?;
-
-            Ok(())
+            spawn_blocking(move || {
+                let mut stream = stream.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                stream.write_all(&bytes)
+                    .map_err(|e| mlua::Error::runtime(format!("Write error: {}", e)))?;
+                Ok::<(), mlua::Error>(())
+            })?
         });
 
         // conn:flush()
         methods.add_method("flush", |_, this, _: ()| {
-            let mut stream = this.stream.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
-            stream.flush()
-                .map_err(|e| mlua::Error::runtime(format!("Flush error: {}", e)))?;
-
-            Ok(())
+            let stream = Arc::clone(&this.stream);
+            spawn_blocking(move || {
+                let mut stream = stream.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Flush error: {}", e)))?;
+                stream.flush()
+                    .map_err(|e| mlua::Error::runtime(format!("Flush error: {}", e)))?;
+                Ok::<(), mlua::Error>(())
+            })?
         });
 
         // conn:close()
         methods.add_method("close", |_, this, _: ()| {
-            let stream = this.stream.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
-            stream.shutdown(std::net::Shutdown::Both)
-                .map_err(|e| mlua::Error::runtime(format!("Close error: {}", e)))?;
-
-            Ok(())
+            let stream = Arc::clone(&this.stream);
+            spawn_blocking(move || {
+                let stream = stream.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                stream.shutdown(std::net::Shutdown::Both)
+                    .map_err(|e| mlua::Error::runtime(format!("Close error: {}", e)))?;
+                Ok::<(), mlua::Error>(())
+            })?
         });
 
         // conn:set_timeout(ms)
@@ -163,8 +187,10 @@ impl UserData for TcpConnection {
 
 fn tcp_connect(_: &Lua, (host, port): (String, u16)) -> mlua::Result<TcpConnection> {
     let addr = format!("{}:{}", host, port);
-    let stream = TcpStream::connect(&addr)
-        .map_err(|e| mlua::Error::runtime(format!("Connect error: {}", e)))?;
+    let stream = spawn_blocking(move || {
+        TcpStream::connect(&addr)
+            .map_err(|e| mlua::Error::runtime(format!("Connect error: {}", e)))
+    })??;
 
     Ok(TcpConnection {
         stream: Arc::new(Mutex::new(stream)),
@@ -181,11 +207,14 @@ impl UserData for TcpServer {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         // server:accept() -> connection
         methods.add_method("accept", |_, this, _: ()| {
-            let listener = this.listener.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
-            let (stream, _addr) = listener.accept()
-                .map_err(|e| mlua::Error::runtime(format!("Accept error: {}", e)))?;
+            let listener = Arc::clone(&this.listener);
+            let stream = spawn_blocking(move || {
+                let listener = listener.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                let (stream, _addr) = listener.accept()
+                    .map_err(|e| mlua::Error::runtime(format!("Accept error: {}", e)))?;
+                Ok::<TcpStream, mlua::Error>(stream)
+            })??;
 
             Ok(TcpConnection {
                 stream: Arc::new(Mutex::new(stream)),
@@ -220,8 +249,10 @@ fn tcp_listen(_: &Lua, (host, port): (Option<String>, u16)) -> mlua::Result<TcpS
     let host = host.unwrap_or_else(|| "0.0.0.0".to_string());
     let addr = format!("{}:{}", host, port);
 
-    let listener = TcpListener::bind(&addr)
-        .map_err(|e| mlua::Error::runtime(format!("Bind error: {}", e)))?;
+    let listener = spawn_blocking(move || {
+        TcpListener::bind(&addr)
+            .map_err(|e| mlua::Error::runtime(format!("Bind error: {}", e)))
+    })??;
 
     Ok(TcpServer {
         listener: Arc::new(Mutex::new(listener)),
@@ -238,62 +269,65 @@ impl UserData for UdpConnection {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         // udp:send(data, host, port) -> bytes_sent
         methods.add_method("send", |_, this, (data, host, port): (mlua::String, String, u16)| {
-            let socket = this.socket.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
-            let addr = format!("{}:{}", host, port);
+            let socket = Arc::clone(&this.socket);
             let bytes: Vec<u8> = data.as_bytes().to_vec();
-            let sent = socket.send_to(&bytes, &addr)
-                .map_err(|e| mlua::Error::runtime(format!("Send error: {}", e)))?;
-
-            Ok(sent)
+            let addr = format!("{}:{}", host, port);
+            spawn_blocking(move || {
+                let socket = socket.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                let sent = socket.send_to(&bytes, &addr)
+                    .map_err(|e| mlua::Error::runtime(format!("Send error: {}", e)))?;
+                Ok::<usize, mlua::Error>(sent)
+            })?
         });
 
         // udp:recv(n) -> data, host, port
         methods.add_method("recv", |lua, this, n: Option<usize>| {
-            let socket = this.socket.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
+            let socket = Arc::clone(&this.socket);
             let n = n.unwrap_or(65535);
-            let mut buffer = vec![0u8; n];
+            let result = spawn_blocking(move || {
+                let socket = socket.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                let mut buffer = vec![0u8; n];
+                let (bytes_read, addr) = socket.recv_from(&mut buffer)
+                    .map_err(|e| mlua::Error::runtime(format!("Recv error: {}", e)))?;
+                buffer.truncate(bytes_read);
+                let host = addr.ip().to_string();
+                let port = addr.port();
+                Ok::<(Vec<u8>, String, u16), mlua::Error>((buffer, host, port))
+            })??;
 
-            let (bytes_read, addr) = socket.recv_from(&mut buffer)
-                .map_err(|e| mlua::Error::runtime(format!("Recv error: {}", e)))?;
-
-            buffer.truncate(bytes_read);
-            let data = lua.create_string(&buffer)?;
-
-            let host = addr.ip().to_string();
-            let port = addr.port();
-
-            Ok((data, host, port))
+            let data = lua.create_string(&result.0)?;
+            Ok((data, result.1, result.2))
         });
 
         // udp:connect(host, port) - Connect to a specific address
         methods.add_method("connect", |_, this, (host, port): (String, u16)| {
-            let socket = this.socket.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
+            let socket = Arc::clone(&this.socket);
             let addr = format!("{}:{}", host, port);
-            socket.connect(&addr)
-                .map_err(|e| mlua::Error::runtime(format!("Connect error: {}", e)))?;
-
-            Ok(())
+            spawn_blocking(move || {
+                let socket = socket.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                socket.connect(&addr)
+                    .map_err(|e| mlua::Error::runtime(format!("Connect error: {}", e)))?;
+                Ok::<(), mlua::Error>(())
+            })?
         });
 
         // udp:send_connected(data) -> bytes_sent (for connected sockets)
         methods.add_method("send_connected", |_, this, data: mlua::String| {
-            let socket = this.socket.lock()
-                .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
-
+            let socket = Arc::clone(&this.socket);
             let bytes: Vec<u8> = data.as_bytes().to_vec();
-            let sent = socket.send(&bytes)
-                .map_err(|e| mlua::Error::runtime(format!("Send error: {}", e)))?;
-
-            Ok(sent)
+            spawn_blocking(move || {
+                let socket = socket.lock()
+                    .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
+                let sent = socket.send(&bytes)
+                    .map_err(|e| mlua::Error::runtime(format!("Send error: {}", e)))?;
+                Ok::<usize, mlua::Error>(sent)
+            })?
         });
 
-        // udp:set_timeout(ms)
+        // udp:set_timeout(ms) — lightweight metadata op, no need for spawn_blocking
         methods.add_method("set_timeout", |_, this, ms: Option<u64>| {
             let socket = this.socket.lock()
                 .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?;
@@ -335,8 +369,10 @@ fn udp_bind(_: &Lua, (host, port): (Option<String>, u16)) -> mlua::Result<UdpCon
     let host = host.unwrap_or_else(|| "0.0.0.0".to_string());
     let addr = format!("{}:{}", host, port);
 
-    let socket = UdpSocket::bind(&addr)
-        .map_err(|e| mlua::Error::runtime(format!("Bind error: {}", e)))?;
+    let socket = spawn_blocking(move || {
+        UdpSocket::bind(&addr)
+            .map_err(|e| mlua::Error::runtime(format!("Bind error: {}", e)))
+    })??;
 
     Ok(UdpConnection {
         socket: Arc::new(Mutex::new(socket)),
@@ -348,10 +384,13 @@ fn udp_bind(_: &Lua, (host, port): (Option<String>, u16)) -> mlua::Result<UdpCon
 fn net_resolve(lua: &Lua, hostname: String) -> mlua::Result<Table> {
     use std::net::ToSocketAddrs;
 
-    let addrs: Vec<_> = format!("{}:0", hostname)
-        .to_socket_addrs()
-        .map_err(|e| mlua::Error::runtime(format!("Resolve error: {}", e)))?
-        .collect();
+    let addrs = spawn_blocking(move || {
+        let addrs: Vec<_> = format!("{}:0", hostname)
+            .to_socket_addrs()
+            .map_err(|e| mlua::Error::runtime(format!("Resolve error: {}", e)))?
+            .collect();
+        Ok::<Vec<std::net::SocketAddr>, mlua::Error>(addrs)
+    })??;
 
     let result = lua.create_table()?;
     for (i, addr) in addrs.iter().enumerate() {

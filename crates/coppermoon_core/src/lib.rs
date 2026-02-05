@@ -7,6 +7,7 @@ pub mod error;
 pub mod runtime;
 pub mod module;
 pub mod async_runtime;
+pub mod event_loop;
 
 pub use error::{Error, Result};
 pub use runtime::Runtime;

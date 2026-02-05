@@ -1,12 +1,18 @@
 //! File system module for CopperMoon
 //!
-//! Provides file and directory operations.
+//! Provides file and directory operations backed by Tokio's async I/O.
+//! From Lua's perspective the API is synchronous; under the hood each
+//! operation runs on the Tokio runtime via `block_on`.
 
 use crate::buffer::Buffer;
 use coppermoon_core::Result;
 use mlua::{Lua, MultiValue, Table, Value};
-use std::fs;
 use std::path::Path;
+
+/// Helper: run a tokio::fs future on the global Tokio runtime.
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    coppermoon_core::block_on(f)
+}
 
 /// Register the fs module
 pub fn register(lua: &Lua) -> Result<Table> {
@@ -66,46 +72,49 @@ pub fn register(lua: &Lua) -> Result<Table> {
 // ---------------------------------------------------------------------------
 
 fn fs_read(_: &Lua, path: String) -> mlua::Result<String> {
-    fs::read_to_string(&path)
+    block_on(tokio::fs::read_to_string(&path))
         .map_err(|e| mlua::Error::runtime(format!("Failed to read file '{}': {}", path, e)))
 }
 
 fn fs_read_bytes(_: &Lua, path: String) -> mlua::Result<Buffer> {
-    let data = fs::read(&path)
+    let data = block_on(tokio::fs::read(&path))
         .map_err(|e| mlua::Error::runtime(format!("Failed to read file '{}': {}", path, e)))?;
     Ok(Buffer::from_bytes(data))
 }
 
 fn fs_write(_: &Lua, (path, content): (String, String)) -> mlua::Result<bool> {
-    fs::write(&path, content)
+    block_on(tokio::fs::write(&path, content))
         .map(|_| true)
         .map_err(|e| mlua::Error::runtime(format!("Failed to write file '{}': {}", path, e)))
 }
 
 fn fs_write_bytes(_: &Lua, (path, content): (String, Value)) -> mlua::Result<bool> {
     let bytes = extract_bytes(content)?;
-    fs::write(&path, bytes)
+    block_on(tokio::fs::write(&path, bytes))
         .map(|_| true)
         .map_err(|e| mlua::Error::runtime(format!("Failed to write file '{}': {}", path, e)))
 }
 
 fn fs_append(_: &Lua, (path, content): (String, String)) -> mlua::Result<bool> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
+    use tokio::io::AsyncWriteExt;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| mlua::Error::runtime(format!("Failed to open file '{}': {}", path, e)))?;
+    block_on(async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .map_err(|e| mlua::Error::runtime(format!("Failed to open file '{}': {}", path, e)))?;
 
-    file.write_all(content.as_bytes())
-        .map(|_| true)
-        .map_err(|e| mlua::Error::runtime(format!("Failed to append to file '{}': {}", path, e)))
+        file.write_all(content.as_bytes())
+            .await
+            .map(|_| true)
+            .map_err(|e| mlua::Error::runtime(format!("Failed to append to file '{}': {}", path, e)))
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Existence / type checks
+// Existence / type checks  (cheap sync Path checks — no I/O benefit from async)
 // ---------------------------------------------------------------------------
 
 fn fs_exists(_: &Lua, path: String) -> mlua::Result<bool> {
@@ -129,18 +138,18 @@ fn fs_is_symlink(_: &Lua, path: String) -> mlua::Result<bool> {
 // ---------------------------------------------------------------------------
 
 fn fs_remove(_: &Lua, path: String) -> mlua::Result<bool> {
-    fs::remove_file(&path)
+    block_on(tokio::fs::remove_file(&path))
         .map(|_| true)
         .map_err(|e| mlua::Error::runtime(format!("Failed to remove file '{}': {}", path, e)))
 }
 
 fn fs_copy(_: &Lua, (src, dest): (String, String)) -> mlua::Result<u64> {
-    fs::copy(&src, &dest)
+    block_on(tokio::fs::copy(&src, &dest))
         .map_err(|e| mlua::Error::runtime(format!("Failed to copy '{}' to '{}': {}", src, dest, e)))
 }
 
 fn fs_rename(_: &Lua, (src, dest): (String, String)) -> mlua::Result<bool> {
-    fs::rename(&src, &dest)
+    block_on(tokio::fs::rename(&src, &dest))
         .map(|_| true)
         .map_err(|e| mlua::Error::runtime(format!("Failed to rename '{}' to '{}': {}", src, dest, e)))
 }
@@ -148,58 +157,69 @@ fn fs_rename(_: &Lua, (src, dest): (String, String)) -> mlua::Result<bool> {
 /// Move a file or directory. Tries rename first (fast, same filesystem),
 /// falls back to copy + delete for cross-filesystem moves.
 fn fs_move(_: &Lua, (src, dest): (String, String)) -> mlua::Result<bool> {
-    // Try rename first (instant if same filesystem)
-    if fs::rename(&src, &dest).is_ok() {
-        return Ok(true);
-    }
+    block_on(async {
+        // Try rename first (instant if same filesystem)
+        if tokio::fs::rename(&src, &dest).await.is_ok() {
+            return Ok(true);
+        }
 
-    let src_path = Path::new(&src);
+        let src_path = Path::new(&src);
 
-    if src_path.is_dir() {
-        // Cross-filesystem directory move: recursive copy then remove
-        copy_dir_recursive(src_path, Path::new(&dest))
-            .map_err(|e| mlua::Error::runtime(format!("Failed to move '{}' to '{}': {}", src, dest, e)))?;
-        fs::remove_dir_all(&src)
-            .map_err(|e| mlua::Error::runtime(format!("Failed to remove source '{}' after move: {}", src, e)))?;
-    } else {
-        // Cross-filesystem file move: copy then remove
-        fs::copy(&src, &dest)
-            .map_err(|e| mlua::Error::runtime(format!("Failed to move '{}' to '{}': {}", src, dest, e)))?;
-        fs::remove_file(&src)
-            .map_err(|e| mlua::Error::runtime(format!("Failed to remove source '{}' after move: {}", src, e)))?;
-    }
+        if src_path.is_dir() {
+            copy_dir_recursive_async(src_path, Path::new(&dest))
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("Failed to move '{}' to '{}': {}", src, dest, e)))?;
+            tokio::fs::remove_dir_all(&src)
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("Failed to remove source '{}' after move: {}", src, e)))?;
+        } else {
+            tokio::fs::copy(&src, &dest)
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("Failed to move '{}' to '{}': {}", src, dest, e)))?;
+            tokio::fs::remove_file(&src)
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("Failed to remove source '{}' after move: {}", src, e)))?;
+        }
 
-    Ok(true)
+        Ok(true)
+    })
 }
 
 fn fs_touch(_: &Lua, path: String) -> mlua::Result<bool> {
-    let p = Path::new(&path);
-    if p.exists() {
-        // Update modification time by opening and setting file length to current length
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
-        let metadata = file.metadata()
-            .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
-        file.set_len(metadata.len())
-            .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
-    } else {
-        // Create parent directories if needed, then create empty file
-        if let Some(parent) = p.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
+    block_on(async {
+        let p = Path::new(&path);
+        if p.exists() {
+            // Update modification time by opening and setting file length to current length
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
+            let metadata = file.metadata()
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
+            file.set_len(metadata.len())
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
+        } else {
+            // Create parent directories if needed, then create empty file
+            if let Some(parent) = p.parent() {
+                if !parent.exists() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
+                }
             }
+            tokio::fs::write(&path, b"")
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
         }
-        fs::write(&path, b"")
-            .map_err(|e| mlua::Error::runtime(format!("Failed to touch '{}': {}", path, e)))?;
-    }
-    Ok(true)
+        Ok(true)
+    })
 }
 
 fn fs_size(_: &Lua, path: String) -> mlua::Result<u64> {
-    let metadata = fs::metadata(&path)
+    let metadata = block_on(tokio::fs::metadata(&path))
         .map_err(|e| mlua::Error::runtime(format!("Failed to get size of '{}': {}", path, e)))?;
     Ok(metadata.len())
 }
@@ -209,53 +229,58 @@ fn fs_size(_: &Lua, path: String) -> mlua::Result<u64> {
 // ---------------------------------------------------------------------------
 
 fn fs_mkdir(_: &Lua, path: String) -> mlua::Result<bool> {
-    fs::create_dir(&path)
+    block_on(tokio::fs::create_dir(&path))
         .map(|_| true)
         .map_err(|e| mlua::Error::runtime(format!("Failed to create directory '{}': {}", path, e)))
 }
 
 fn fs_mkdir_all(_: &Lua, path: String) -> mlua::Result<bool> {
-    fs::create_dir_all(&path)
+    block_on(tokio::fs::create_dir_all(&path))
         .map(|_| true)
         .map_err(|e| mlua::Error::runtime(format!("Failed to create directories '{}': {}", path, e)))
 }
 
 fn fs_rmdir(_: &Lua, path: String) -> mlua::Result<bool> {
-    fs::remove_dir(&path)
+    block_on(tokio::fs::remove_dir(&path))
         .map(|_| true)
         .map_err(|e| mlua::Error::runtime(format!("Failed to remove directory '{}': {}", path, e)))
 }
 
 fn fs_rmdir_all(_: &Lua, path: String) -> mlua::Result<bool> {
-    fs::remove_dir_all(&path)
+    block_on(tokio::fs::remove_dir_all(&path))
         .map(|_| true)
         .map_err(|e| mlua::Error::runtime(format!("Failed to remove directories '{}': {}", path, e)))
 }
 
 fn fs_readdir(lua: &Lua, path: String) -> mlua::Result<Table> {
-    let entries = fs::read_dir(&path)
-        .map_err(|e| mlua::Error::runtime(format!("Failed to read directory '{}': {}", path, e)))?;
+    block_on(async {
+        let mut entries = tokio::fs::read_dir(&path)
+            .await
+            .map_err(|e| mlua::Error::runtime(format!("Failed to read directory '{}': {}", path, e)))?;
 
-    let result = lua.create_table()?;
-    let mut index = 1;
+        let result = lua.create_table()?;
+        let mut index = 1;
 
-    for entry in entries {
-        if let Ok(entry) = entry {
+        while let Some(entry) = entries.next_entry().await
+            .map_err(|e| mlua::Error::runtime(format!("Failed to read directory '{}': {}", path, e)))? {
             if let Some(name) = entry.file_name().to_str() {
                 result.set(index, name)?;
                 index += 1;
             }
         }
-    }
 
-    Ok(result)
+        Ok(result)
+    })
 }
 
 /// Recursively copy a directory.
 fn fs_copy_dir(_: &Lua, (src, dest): (String, String)) -> mlua::Result<bool> {
-    copy_dir_recursive(Path::new(&src), Path::new(&dest))
-        .map(|_| true)
-        .map_err(|e| mlua::Error::runtime(format!("Failed to copy directory '{}' to '{}': {}", src, dest, e)))
+    block_on(async {
+        copy_dir_recursive_async(Path::new(&src), Path::new(&dest))
+            .await
+            .map(|_| true)
+            .map_err(|e| mlua::Error::runtime(format!("Failed to copy directory '{}' to '{}': {}", src, dest, e)))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -263,54 +288,57 @@ fn fs_copy_dir(_: &Lua, (src, dest): (String, String)) -> mlua::Result<bool> {
 // ---------------------------------------------------------------------------
 
 fn fs_stat(lua: &Lua, path: String) -> mlua::Result<Table> {
-    let metadata = fs::metadata(&path)
-        .map_err(|e| mlua::Error::runtime(format!("Failed to get metadata for '{}': {}", path, e)))?;
+    block_on(async {
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| mlua::Error::runtime(format!("Failed to get metadata for '{}': {}", path, e)))?;
 
-    let result = lua.create_table()?;
+        let result = lua.create_table()?;
 
-    result.set("size", metadata.len())?;
-    result.set("is_file", metadata.is_file())?;
-    result.set("is_dir", metadata.is_dir())?;
-    result.set("readonly", metadata.permissions().readonly())?;
+        result.set("size", metadata.len())?;
+        result.set("is_file", metadata.is_file())?;
+        result.set("is_dir", metadata.is_dir())?;
+        result.set("readonly", metadata.permissions().readonly())?;
 
-    // Symlink check uses symlink_metadata
-    let is_symlink = fs::symlink_metadata(&path)
-        .map(|m| m.is_symlink())
-        .unwrap_or(false);
-    result.set("is_symlink", is_symlink)?;
+        // Symlink check uses symlink_metadata
+        let is_symlink = tokio::fs::symlink_metadata(&path)
+            .await
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+        result.set("is_symlink", is_symlink)?;
 
-    // Modified time (Unix timestamp)
-    if let Ok(modified) = metadata.modified() {
-        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-            result.set("modified", duration.as_secs())?;
+        // Modified time (Unix timestamp)
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                result.set("modified", duration.as_secs())?;
+            }
         }
-    }
 
-    // Created time (Unix timestamp)
-    if let Ok(created) = metadata.created() {
-        if let Ok(duration) = created.duration_since(std::time::UNIX_EPOCH) {
-            result.set("created", duration.as_secs())?;
+        // Created time (Unix timestamp)
+        if let Ok(created) = metadata.created() {
+            if let Ok(duration) = created.duration_since(std::time::UNIX_EPOCH) {
+                result.set("created", duration.as_secs())?;
+            }
         }
-    }
 
-    // Accessed time (Unix timestamp)
-    if let Ok(accessed) = metadata.accessed() {
-        if let Ok(duration) = accessed.duration_since(std::time::UNIX_EPOCH) {
-            result.set("accessed", duration.as_secs())?;
+        // Accessed time (Unix timestamp)
+        if let Ok(accessed) = metadata.accessed() {
+            if let Ok(duration) = accessed.duration_since(std::time::UNIX_EPOCH) {
+                result.set("accessed", duration.as_secs())?;
+            }
         }
-    }
 
-    Ok(result)
+        Ok(result)
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Path utilities
+// Path utilities  (pure path manipulation — no I/O, stays sync)
 // ---------------------------------------------------------------------------
 
 fn fs_abs(_: &Lua, path: String) -> mlua::Result<String> {
-    let abs = fs::canonicalize(&path)
+    let abs = block_on(tokio::fs::canonicalize(&path))
         .map_err(|e| mlua::Error::runtime(format!("Failed to resolve path '{}': {}", path, e)))?;
-    // On Windows, canonicalize returns \\?\ prefix — strip it for usability
     let s = abs.to_string_lossy().to_string();
     #[cfg(target_os = "windows")]
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
@@ -355,7 +383,7 @@ fn fs_ext(_: &Lua, path: String) -> mlua::Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Search
+// Search  (glob crate is synchronous — no async equivalent)
 // ---------------------------------------------------------------------------
 
 fn fs_glob(lua: &Lua, pattern: String) -> mlua::Result<Table> {
@@ -376,7 +404,7 @@ fn fs_glob(lua: &Lua, pattern: String) -> mlua::Result<Table> {
 }
 
 // ---------------------------------------------------------------------------
-// Environment
+// Environment  (std::env calls — no I/O, stays sync)
 // ---------------------------------------------------------------------------
 
 fn fs_cwd(_: &Lua, _: ()) -> mlua::Result<String> {
@@ -407,20 +435,20 @@ fn extract_bytes(value: Value) -> mlua::Result<Vec<u8>> {
     }
 }
 
-/// Recursively copy a directory tree.
-fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dest)?;
+/// Recursively copy a directory tree (async version).
+async fn copy_dir_recursive_async(src: &Path, dest: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dest).await?;
 
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+    let mut entries = tokio::fs::read_dir(src).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
 
         if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
+            Box::pin(copy_dir_recursive_async(&src_path, &dest_path)).await?;
         } else {
-            fs::copy(&src_path, &dest_path)?;
+            tokio::fs::copy(&src_path, &dest_path).await?;
         }
     }
 
