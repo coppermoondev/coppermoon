@@ -53,6 +53,20 @@ jobs:
           path: crates/shipyard
           token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
+      - name: Checkout HoneyMoon
+        uses: actions/checkout@v4
+        with:
+          repository: coppermoondev/honeymoon
+          path: packages/honeymoon
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
+
+      - name: Checkout Vein
+        uses: actions/checkout@v4
+        with:
+          repository: coppermoondev/vein
+          path: packages/vein
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
