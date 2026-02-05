@@ -44,12 +44,14 @@ jobs:
         with:
           repository: coppermoondev/harbor
           path: crates/harbor
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
       - name: Checkout Shipyard
         uses: actions/checkout@v4
         with:
           repository: coppermoondev/shipyard
           path: crates/shipyard
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

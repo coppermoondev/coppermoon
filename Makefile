@@ -84,9 +84,12 @@ ifndef VERSION
 endif
 	@echo "Publishing CopperMoon v$(VERSION)..."
 	@echo ""
-	@echo "  1. Creating tag v$(VERSION)"
+	@echo "  1. Cleaning up existing tag v$(VERSION) (if any)"
+	-git tag -d v$(VERSION) 2>/dev/null
+	-git push origin --delete v$(VERSION) 2>/dev/null
+	@echo "  2. Creating tag v$(VERSION)"
 	git tag -a v$(VERSION) -m "Release v$(VERSION)"
-	@echo "  2. Pushing tag to origin"
+	@echo "  3. Pushing tag to origin"
 	git push origin v$(VERSION)
 	@echo ""
 	@echo "Done! GitHub Actions will now build and create the release."

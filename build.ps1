@@ -98,6 +98,12 @@ function Invoke-Publish {
     Write-Host "  Publishing CopperMoon v$Version..." -ForegroundColor White
     Write-Host ""
 
+    Write-Step "Cleaning up existing tag v$Version (if any)"
+    $ErrorActionPreference = "Continue"
+    git tag -d "v$Version" 2>&1 | Out-Null
+    git push origin --delete "v$Version" 2>&1 | Out-Null
+    $ErrorActionPreference = "Stop"
+
     Write-Step "Creating tag v$Version"
     git tag -a "v$Version" -m "Release v$Version"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
