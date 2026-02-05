@@ -161,6 +161,11 @@ coppermoon_mysql::register_global(lua)?;
 let mysql_module = coppermoon_mysql::register(lua)?;
 ```
 
+## Related
+
+- [CopperMoon](https://github.com/coppermoondev/coppermoon) — Main repository and runtime
+- [Freight](https://github.com/coppermoondev/freight) — ORM built on top of database bindings
+
 ## Documentation
 
 For full documentation, visit [coppermoon.dev](https://coppermoon.dev).

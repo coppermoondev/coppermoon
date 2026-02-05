@@ -194,6 +194,12 @@ globals.set("crypto", coppermoon_std::crypto::register(lua)?)?;
 - `dirs` — System directories
 - `rand` — Random number generation
 
+## Related
+
+- [CopperMoon](https://github.com/coppermoondev/coppermoon) — Main repository and runtime
+- [Harbor](https://github.com/coppermoondev/harbor) — Package manager
+- [Shipyard](https://github.com/coppermoondev/shipyard) — Project toolchain
+
 ## Documentation
 
 For full documentation, visit [coppermoon.dev](https://coppermoon.dev).

@@ -112,6 +112,11 @@ coppermoon_sqlite::register_global(lua)?;
 let sqlite_module = coppermoon_sqlite::register(lua)?;
 ```
 
+## Related
+
+- [CopperMoon](https://github.com/coppermoondev/coppermoon) — Main repository and runtime
+- [Freight](https://github.com/coppermoondev/freight) — ORM built on top of database bindings
+
 ## Documentation
 
 For full documentation, visit [coppermoon.dev](https://coppermoon.dev).

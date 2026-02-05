@@ -76,17 +76,17 @@ crates/coppermoon/
 
 | Crate | Description |
 |-------|-------------|
-| [`coppermoon_core`](../coppermoon_core/README.md) | Core runtime engine |
-| [`coppermoon_std`](../coppermoon_std/README.md) | Standard library modules |
-| [`coppermoon_sqlite`](../sqlite/README.md) | SQLite bindings |
-| [`coppermoon_mysql`](../mysql/README.md) | MySQL bindings |
+| `coppermoon_core` | Core runtime engine |
+| `coppermoon_std` | Standard library modules |
+| `coppermoon_sqlite` | SQLite bindings |
+| `coppermoon_mysql` | MySQL bindings |
 
-## Related Tools
+## Related
 
-| Tool | Description |
-|------|-------------|
-| [Harbor](../harbor/README.md) | Package manager |
-| [Shipyard](../shipyard/README.md) | Project toolchain |
+- [CopperMoon](https://github.com/coppermoondev/coppermoon) — Main repository
+- [Harbor](https://github.com/coppermoondev/harbor) — Package manager
+- [Shipyard](https://github.com/coppermoondev/shipyard) — Project toolchain
+- [HoneyMoon](https://github.com/coppermoondev/honeymoon) — Web framework
 
 ## Documentation
 

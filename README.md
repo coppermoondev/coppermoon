@@ -15,9 +15,9 @@ CopperMoon is a complete Lua execution environment, similar to what Node.js is f
 | Component | Role |
 |-----------|------|
 | **CopperMoon** | Lua runtime (execution engine, async I/O, Lua VM) |
-| **Harbor** | Package manager (dependency management) |
-| **Shipyard** | Toolchain (CLI, project scaffolding, build, dev server) |
-| **HoneyMoon** | Web framework (routing, middleware, plugins) |
+| **[Harbor](https://github.com/coppermoondev/harbor)** | Package manager (dependency management) |
+| **[Shipyard](https://github.com/coppermoondev/shipyard)** | Toolchain (CLI, project scaffolding, build, dev server) |
+| **[HoneyMoon](https://github.com/coppermoondev/honeymoon)** | Web framework (routing, middleware, plugins) |
 
 ---
 
@@ -47,7 +47,7 @@ CopperMoon is a complete Lua execution environment, similar to what Node.js is f
 Download the latest release from [coppermoon.dev](https://coppermoon.dev), or build from source:
 
 ```bash
-git clone https://github.com/user/coppermoon.git
+git clone https://github.com/coppermoondev/coppermoon.git
 cd coppermoon
 cargo build --release
 ```
@@ -213,17 +213,17 @@ Logger, CORS, body parsers (JSON, URL-encoded), static files, rate limiting, aut
 
 | Package | Description |
 |---------|-------------|
-| [honeymoon](packages/honeymoon/) | Web framework (Express.js-like) |
-| [freight](packages/freight/) | ORM inspired by GORM |
-| [vein](packages/vein/) | Templating engine |
-| [ember](packages/ember/) | Structured logging |
-| [lantern](packages/lantern/) | Debug toolbar for HoneyMoon |
-| [assay](packages/assay/) | Unit testing framework (Jest-like) |
-| [dotenv](packages/dotenv/) | .env file loader |
-| [redis](packages/redis/) | Redis client |
-| [mqtt](packages/mqtt/) | MQTT client |
-| [s3](packages/s3/) | S3-compatible storage client |
-| [tailwind](packages/tailwind/) | TailwindCSS integration |
+| [HoneyMoon](https://github.com/coppermoondev/honeymoon) | Web framework (Express.js-like) |
+| [Freight](https://github.com/coppermoondev/freight) | ORM inspired by GORM |
+| [Vein](https://github.com/coppermoondev/vein) | Templating engine |
+| [Ember](https://github.com/coppermoondev/ember) | Structured logging |
+| [Lantern](https://github.com/coppermoondev/lantern) | Debug toolbar for HoneyMoon |
+| [Assay](https://github.com/coppermoondev/assay) | Unit testing framework (Jest-like) |
+| [Dotenv](https://github.com/coppermoondev/dotenv) | .env file loader |
+| [Redis](https://github.com/coppermoondev/redis) | Redis client |
+| [MQTT](https://github.com/coppermoondev/mqtt) | MQTT client |
+| [S3](https://github.com/coppermoondev/s3) | S3-compatible storage client |
+| [Tailwind](https://github.com/coppermoondev/tailwind) | TailwindCSS integration |
 
 ---
 

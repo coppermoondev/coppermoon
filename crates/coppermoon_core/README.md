@@ -91,6 +91,12 @@ fn do_work() -> Result<()> {
 - `thiserror` / `anyhow` — Error handling
 - `tracing` — Logging
 
+## Related
+
+- [CopperMoon](https://github.com/coppermoondev/coppermoon) — Main repository and runtime
+- [Harbor](https://github.com/coppermoondev/harbor) — Package manager
+- [Shipyard](https://github.com/coppermoondev/shipyard) — Project toolchain
+
 ## Documentation
 
 For full documentation, visit [coppermoon.dev](https://coppermoon.dev).
