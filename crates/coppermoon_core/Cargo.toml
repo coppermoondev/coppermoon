@@ -1,0 +1,20 @@
+[package]
+name = "coppermoon_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core runtime engine for CopperMoon"
+
+[dependencies]
+mlua.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libloading.workspace = true
+
+[dev-dependencies]
+tempfile = "3.17"

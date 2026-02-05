@@ -1,0 +1,28 @@
+[package]
+name = "coppermoon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A high-performance Lua runtime written in Rust"
+
+[[bin]]
+name = "coppermoon"
+path = "src/main.rs"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+coppermoon_core = { path = "../coppermoon_core" }
+coppermoon_std = { path = "../coppermoon_std" }
+coppermoon_sqlite = { path = "../sqlite" }
+coppermoon_mysql = { path = "../mysql" }
+mlua.workspace = true
+tokio.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+colored.workspace = true

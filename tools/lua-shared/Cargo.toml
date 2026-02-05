@@ -1,0 +1,9 @@
+[package]
+name = "lua-shared-builder"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+cc = "1"

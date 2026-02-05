@@ -1,0 +1,13 @@
+[package]
+name = "hello_native"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+name = "hello_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+mlua = { version = "0.10", features = ["lua54", "module"] }

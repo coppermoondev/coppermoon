@@ -1,0 +1,51 @@
+[package]
+name = "coppermoon_std"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Standard library modules for CopperMoon"
+
+[dependencies]
+coppermoon_core = { path = "../coppermoon_core" }
+mlua.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# For os module
+dirs = "6.0"
+hostname = "0.4"
+
+# For crypto module
+sha2 = "0.10"
+sha1 = "0.10"
+md5 = "0.7"
+hmac = "0.12"
+rand = "0.9"
+uuid = { version = "1.16", features = ["v4"] }
+base64 = "0.22"
+hex = "0.4"
+
+# For terminal module
+crossterm = "0.28"
+
+# For http module
+reqwest = { version = "0.12", features = ["blocking", "json", "cookies"] }
+
+# For websocket module
+tungstenite = { version = "0.26", features = ["native-tls"] }
+
+# For fs module (glob)
+glob = "0.3"
+
+# For datetime module
+chrono = "0.4"
+
+# For archive module
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"

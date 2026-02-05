@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock
+nul
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log
+tmp/
+
+# Build
+dist/
+
+# Separate repos
+/crates/harbor/
+/crates/shipyard/
+/packages/
+/apps/

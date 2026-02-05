@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd /c \"mkdir e:\\\\Development\\\\coppermoon\\\\apps\\\\coppermine\\\\content\\\\time 2>nul\")"
+    ]
+  }
+}
