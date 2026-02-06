@@ -105,6 +105,12 @@ fn server_new(lua: &Lua, _: ()) -> mlua::Result<Table> {
         Ok(server)
     })?)?;
 
+    server.set("head", lua.create_function(|_, (server, path, handler): (Table, String, Function)| {
+        let routes: Table = server.get("_routes")?;
+        routes.set(format!("HEAD:{}", path), handler)?;
+        Ok(server)
+    })?)?;
+
     server.set("listen", lua.create_function(server_listen)?)?;
 
     Ok(server)
@@ -385,10 +391,18 @@ fn dispatch_to_lua_inner(
     let all_key = format!("ALL:{}", request.path);
     let all_wildcard = "ALL:*".to_string();
 
-    let handler_key = route_handlers.get(&route_key)
+    let mut handler_key = route_handlers.get(&route_key)
         .or_else(|| route_handlers.get(&wildcard_key))
         .or_else(|| route_handlers.get(&all_key))
         .or_else(|| route_handlers.get(&all_wildcard));
+
+    // HEAD falls back to GET per HTTP spec (RFC 7231 §4.3.2)
+    if handler_key.is_none() && request.method == "HEAD" {
+        let get_key = format!("GET:{}", request.path);
+        let get_wildcard = "GET:*".to_string();
+        handler_key = route_handlers.get(&get_key)
+            .or_else(|| route_handlers.get(&get_wildcard));
+    }
 
     let Some(reg_key) = handler_key else {
         return Ok(HttpResponse {

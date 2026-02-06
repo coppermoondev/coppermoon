@@ -27,6 +27,10 @@ dist/
 /crates/harbor/
 /harbor-registry/
 /harbor-registry/** */
+/quarry/
+/quarry/** */
+/crates/quarry/
+/crates/quarry/** */
 /crates/shipyard/
 /packages/
 /apps/

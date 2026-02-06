@@ -6,13 +6,14 @@ members = [
     "crates/coppermoon_std",
     "crates/harbor",
     "crates/shipyard",
+    "crates/quarry",
     "crates/sqlite",
     "crates/mysql",
     "crates/postgresql",
 ]
 
 [workspace.package]
-version = "0.1.31"
+version = "0.1.4"
 edition = "2021"
 authors = ["CopperMoon Contributors"]
 license = "MIT"

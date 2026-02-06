@@ -53,6 +53,13 @@ jobs:
           path: crates/shipyard
           token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
+      - name: Checkout Quarry
+        uses: actions/checkout@v4
+        with:
+          repository: coppermoondev/quarry
+          path: crates/quarry
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
+
       - name: Checkout HoneyMoon
         uses: actions/checkout@v4
         with:
@@ -109,7 +116,7 @@ jobs:
         run: |
           ARCHIVE_NAME="coppermoon-${{ matrix.target }}"
           mkdir -p "${ARCHIVE_NAME}"
-          for bin in coppermoon harbor shipyard; do
+          for bin in coppermoon harbor shipyard quarry; do
             if [ -f "target/${{ matrix.target }}/release/${bin}" ]; then
               cp "target/${{ matrix.target }}/release/${bin}" "${ARCHIVE_NAME}/"
             fi
@@ -123,7 +130,7 @@ jobs:
         run: |
           $archiveName = "coppermoon-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $archiveName -Force | Out-Null
-          foreach ($bin in @("coppermoon", "harbor", "shipyard")) {
+          foreach ($bin in @("coppermoon", "harbor", "shipyard", "quarry")) {
             $src = "target/${{ matrix.target }}/release/${bin}.exe"
             if (Test-Path $src) {
               Copy-Item $src "$archiveName/${bin}.exe"
