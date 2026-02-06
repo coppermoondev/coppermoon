@@ -261,16 +261,18 @@ async fn handle_connection_inner(
     };
 
     // Send to main Lua thread and wait for response.
+    let is_head = request.method == "HEAD";
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send((request, resp_tx))?;
 
     match resp_rx.await {
         Ok(response) => {
-            let bytes = build_response_bytes(
+            let bytes = build_response_bytes_ex(
                 response.status,
                 &response.content_type,
                 &response.body,
                 &response.headers,
+                is_head,
             );
             writer.write_all(&bytes).await.ok();
             writer.flush().await.ok();
@@ -634,6 +636,18 @@ fn build_response_bytes(
     body: &str,
     extra_headers: &[(String, String)],
 ) -> Vec<u8> {
+    build_response_bytes_ex(status, content_type, body, extra_headers, false)
+}
+
+/// Build HTTP response bytes. When `head_only` is true, Content-Length reflects
+/// the body size but the body itself is omitted (HTTP HEAD semantics).
+fn build_response_bytes_ex(
+    status: u16,
+    content_type: &str,
+    body: &str,
+    extra_headers: &[(String, String)],
+    head_only: bool,
+) -> Vec<u8> {
     let status_text = match status {
         200 => "OK",
         201 => "Created",
@@ -675,6 +689,8 @@ fn build_response_bytes(
     }
 
     response.push_str("\r\n");
-    response.push_str(body);
+    if !head_only {
+        response.push_str(body);
+    }
     response.into_bytes()
 }
