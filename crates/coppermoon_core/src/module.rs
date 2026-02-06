@@ -217,9 +217,11 @@ fn resolve_native_path(base_path: &Path, module_name: &str) -> Option<PathBuf> {
     // Search patterns:
     // 1. harbor_modules/<path>/native/<lib>  (installed packages where dir matches module name)
     // 2. <path>/native/<lib>                 (local native modules)
+    // 3. native/<lib>                        (running from within a native package root)
     let patterns = [
         format!("harbor_modules/{}/native/{}", module_path, lib_filename),
         format!("{}/native/{}", module_path, lib_filename),
+        format!("native/{}", lib_filename),
     ];
 
     for pattern in &patterns {
