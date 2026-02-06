@@ -1,5 +1,5 @@
 # CopperMoon Installer — Windows
-# Usage: irm https://coppermoon.dev/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/coppermoondev/coppermoon/refs/heads/main/installer/install.ps1 | iex
 #
 # Environment variables:
 #   COPPERMOON_INSTALL_DIR     — Custom install directory (default: ~\.coppermoon\bin)
@@ -83,7 +83,7 @@ try {
 }
 
 # Move binaries to install dir
-$Binaries = @("coppermoon.exe", "harbor.exe", "shipyard.exe")
+$Binaries = @("coppermoon.exe", "harbor.exe", "shipyard.exe", "quarry.exe")
 foreach ($bin in $Binaries) {
     # Check root and subdirectories
     $found = Get-ChildItem -Path $TmpDir -Filter $bin -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -123,7 +123,7 @@ if (-not $SkipPath) {
 # ─── Verify ──────────────────────────────────────────────────────────
 Write-Host ""
 
-foreach ($bin in @("coppermoon", "harbor", "shipyard")) {
+foreach ($bin in @("coppermoon", "harbor", "shipyard", "quarry")) {
     $binPath = Join-Path $InstallDir "$bin.exe"
     if (Test-Path $binPath) {
         try {

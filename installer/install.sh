@@ -1,6 +1,6 @@
 #!/bin/sh
 # CopperMoon Installer — Linux & macOS
-# Usage: curl -fsSL https://coppermoon.dev/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/coppermoondev/coppermoon/refs/heads/main/installer/install.sh | sh
 #        COPPERMOON_ARCHIVE=/path/to/coppermoon-x86_64-unknown-linux-gnu.tar.gz sh install.sh
 #
 # Environment variables:
@@ -119,7 +119,7 @@ tar xzf "$ARCHIVE" -C "$TMPDIR" 2>/dev/null || {
 }
 
 # Move binaries to install dir (check both root and subdirectory)
-for bin in coppermoon harbor shipyard; do
+for bin in coppermoon harbor shipyard quarry; do
     SRC=""
     if [ -f "${TMPDIR}/${bin}" ]; then
         SRC="${TMPDIR}/${bin}"
@@ -218,6 +218,10 @@ fi
 if [ -x "${INSTALL_DIR}/shipyard" ]; then
     VER=$("${INSTALL_DIR}/shipyard" --version 2>/dev/null || echo "installed")
     success "shipyard    ${DIM}${VER}${RESET}"
+fi
+if [ -x "${INSTALL_DIR}/quarry" ]; then
+    VER=$("${INSTALL_DIR}/quarry" --version 2>/dev/null || echo "installed")
+    success "quarry      ${DIM}${VER}${RESET}"
 fi
 
 # ─── Success ─────────────────────────────────────────────────────────

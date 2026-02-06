@@ -2,20 +2,20 @@
 
 Cross-platform install scripts for [CopperMoon](https://github.com/coppermoondev/coppermoon).
 
-Installs **coppermoon**, **harbor**, and **shipyard** binaries.
+Installs **coppermoon**, **harbor**, **shipyard**, and **quarry** binaries.
 
 ## Quick Install
 
 ### Linux / macOS
 
 ```sh
-curl -fsSL https://coppermoon.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/coppermoondev/coppermoon/refs/heads/main/installer/install.sh | sh
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://coppermoon.dev/install.ps1 | iex
+irm https://raw.githubusercontent.com/coppermoondev/coppermoon/refs/heads/main/installer/install.ps1 | iex
 ```
 
 ## Options
@@ -32,18 +32,18 @@ irm https://coppermoon.dev/install.ps1 | iex
 
 ```sh
 # Install specific version
-COPPERMOON_VERSION=0.2.0 curl -fsSL https://coppermoon.dev/install.sh | sh
+COPPERMOON_VERSION=0.2.0 curl -fsSL https://raw.githubusercontent.com/coppermoondev/coppermoon/refs/heads/main/installer/install.sh | sh
 
 # Custom install directory
-COPPERMOON_INSTALL_DIR=/usr/local/bin curl -fsSL https://coppermoon.dev/install.sh | sh
+COPPERMOON_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/coppermoondev/coppermoon/refs/heads/main/installer/install.sh | sh
 
 # Skip PATH modification
-COPPERMOON_NO_MODIFY_PATH=1 curl -fsSL https://coppermoon.dev/install.sh | sh
+COPPERMOON_NO_MODIFY_PATH=1 curl -fsSL https://raw.githubusercontent.com/coppermoondev/coppermoon/refs/heads/main/installer/install.sh | sh
 ```
 
 ```powershell
 # Install specific version (Windows)
-$env:COPPERMOON_VERSION="0.2.0"; irm https://coppermoon.dev/install.ps1 | iex
+$env:COPPERMOON_VERSION="0.2.0"; irm https://raw.githubusercontent.com/coppermoondev/coppermoon/refs/heads/main/installer/install.ps1 | iex
 ```
 
 ## Manual Install
