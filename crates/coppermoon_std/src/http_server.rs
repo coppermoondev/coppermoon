@@ -37,7 +37,7 @@ struct ParsedRequest {
 struct HttpResponse {
     status: u16,
     content_type: String,
-    body: String,
+    body: Vec<u8>,
     headers: Vec<(String, String)>,
 }
 
@@ -373,7 +373,7 @@ fn dispatch_to_lua(
             HttpResponse {
                 status: 500,
                 content_type: "text/plain".into(),
-                body: format!("Internal Server Error: {}", e),
+                body: format!("Internal Server Error: {}", e).into_bytes(),
                 headers: Vec::new(),
             }
         }
@@ -408,7 +408,7 @@ fn dispatch_to_lua_inner(
         return Ok(HttpResponse {
             status: 404,
             content_type: "text/plain".into(),
-            body: "Not Found".into(),
+            body: b"Not Found".to_vec(),
             headers: Vec::new(),
         });
     };
@@ -479,13 +479,14 @@ fn dispatch_to_lua_inner(
 
     let status: u16 = ctx.get("_status").unwrap_or(200);
     let content_type: String = ctx.get("_content_type").unwrap_or_else(|_| "text/plain".to_string());
-    let body: String = ctx.get("_body").unwrap_or_else(|_| {
-        match result {
-            Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
-            Value::Nil => String::new(),
-            _ => value_to_json(&result).unwrap_or_default(),
-        }
-    });
+    let body: Vec<u8> = match ctx.get::<mlua::String>("_body") {
+        Ok(s) => s.as_bytes().to_vec(),
+        Err(_) => match result {
+            Value::String(s) => s.as_bytes().to_vec(),
+            Value::Nil => Vec::new(),
+            _ => value_to_json(&result).unwrap_or_default().into_bytes(),
+        },
+    };
 
     // Read custom headers from ctx._headers
     let mut extra_headers = Vec::new();
@@ -650,7 +651,7 @@ fn build_response_bytes(
     body: &str,
     extra_headers: &[(String, String)],
 ) -> Vec<u8> {
-    build_response_bytes_ex(status, content_type, body, extra_headers, false)
+    build_response_bytes_ex(status, content_type, body.as_bytes(), extra_headers, false)
 }
 
 /// Build HTTP response bytes. When `head_only` is true, Content-Length reflects
@@ -658,7 +659,7 @@ fn build_response_bytes(
 fn build_response_bytes_ex(
     status: u16,
     content_type: &str,
-    body: &str,
+    body: &[u8],
     extra_headers: &[(String, String)],
     head_only: bool,
 ) -> Vec<u8> {
@@ -690,7 +691,7 @@ fn build_response_bytes_ex(
         _ => "Unknown",
     };
 
-    let mut response = format!(
+    let mut header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         status,
         status_text,
@@ -699,12 +700,14 @@ fn build_response_bytes_ex(
     );
 
     for (key, value) in extra_headers {
-        response.push_str(&format!("{}: {}\r\n", key, value));
+        header.push_str(&format!("{}: {}\r\n", key, value));
     }
 
-    response.push_str("\r\n");
+    header.push_str("\r\n");
+
+    let mut bytes = header.into_bytes();
     if !head_only {
-        response.push_str(body);
+        bytes.extend_from_slice(body);
     }
-    response.into_bytes()
+    bytes
 }
