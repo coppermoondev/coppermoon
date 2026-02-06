@@ -1,10 +1,12 @@
 #!/bin/sh
 # CopperMoon Installer — Linux & macOS
 # Usage: curl -fsSL https://coppermoon.dev/install.sh | sh
+#        COPPERMOON_ARCHIVE=/path/to/coppermoon-x86_64-unknown-linux-gnu.tar.gz sh install.sh
 #
 # Environment variables:
-#   COPPERMOON_INSTALL_DIR  — Custom install directory (default: ~/.coppermoon/bin)
-#   COPPERMOON_VERSION      — Specific version to install (default: latest)
+#   COPPERMOON_INSTALL_DIR    — Custom install directory (default: ~/.coppermoon/bin)
+#   COPPERMOON_VERSION        — Specific version to install (default: latest)
+#   COPPERMOON_ARCHIVE        — Path to a local .tar.gz archive (skips download)
 #   COPPERMOON_NO_MODIFY_PATH — Set to 1 to skip PATH modification
 
 set -e
@@ -55,45 +57,57 @@ INSTALL_DIR="${COPPERMOON_INSTALL_DIR:-$HOME/.coppermoon/bin}"
 VERSION="${COPPERMOON_VERSION:-latest}"
 GITHUB_REPO="coppermoondev/coppermoon"
 NO_MODIFY_PATH="${COPPERMOON_NO_MODIFY_PATH:-0}"
-
-if [ "$VERSION" = "latest" ]; then
-    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/coppermoon-${TARGET}.tar.gz"
-else
-    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}/coppermoon-${TARGET}.tar.gz"
-fi
+LOCAL_ARCHIVE="${COPPERMOON_ARCHIVE:-}"
 
 info "Install directory: ${BOLD}${INSTALL_DIR}${RESET}"
-info "Version: ${BOLD}${VERSION}${RESET}"
-
-# ─── Check for download tool ────────────────────────────────────────
-if command -v curl > /dev/null 2>&1; then
-    DOWNLOADER="curl"
-elif command -v wget > /dev/null 2>&1; then
-    DOWNLOADER="wget"
-else
-    error "Neither curl nor wget found. Please install one and try again."
-fi
 
 # ─── Create install directory ────────────────────────────────────────
 mkdir -p "$INSTALL_DIR" || error "Failed to create directory: $INSTALL_DIR"
 
-# ─── Download ────────────────────────────────────────────────────────
+# ─── Get archive (local or download) ─────────────────────────────────
 TMPDIR="$(mktemp -d)"
 ARCHIVE="${TMPDIR}/coppermoon.tar.gz"
 
-info "Downloading CopperMoon..."
-
-if [ "$DOWNLOADER" = "curl" ]; then
-    HTTP_CODE=$(curl -fSL -w "%{http_code}" -o "$ARCHIVE" "$DOWNLOAD_URL" 2>/dev/null) || true
-    if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "302" ]; then
+if [ -n "$LOCAL_ARCHIVE" ]; then
+    # ─── Local archive ────────────────────────────────────────────
+    if [ ! -f "$LOCAL_ARCHIVE" ]; then
         rm -rf "$TMPDIR"
-        error "Download failed (HTTP $HTTP_CODE). Check that version '${VERSION}' exists for ${TARGET}.\n  URL: ${DOWNLOAD_URL}"
+        error "Local archive not found: $LOCAL_ARCHIVE"
     fi
+    info "Using local archive: ${BOLD}${LOCAL_ARCHIVE}${RESET}"
+    cp "$LOCAL_ARCHIVE" "$ARCHIVE"
 else
-    wget -q -O "$ARCHIVE" "$DOWNLOAD_URL" 2>/dev/null || {
-        rm -rf "$TMPDIR"
-        error "Download failed. Check that version '${VERSION}' exists for ${TARGET}.\n  URL: ${DOWNLOAD_URL}"
-    }
+    # ─── Download ─────────────────────────────────────────────────
+    if [ "$VERSION" = "latest" ]; then
+        DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/coppermoon-${TARGET}.tar.gz"
+    else
+        DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}/coppermoon-${TARGET}.tar.gz"
+    fi
+
+    info "Version: ${BOLD}${VERSION}${RESET}"
+
+    if command -v curl > /dev/null 2>&1; then
+        DOWNLOADER="curl"
+    elif command -v wget > /dev/null 2>&1; then
+        DOWNLOADER="wget"
+    else
+        error "Neither curl nor wget found. Please install one and try again."
+    fi
+
+    info "Downloading CopperMoon..."
+
+    if [ "$DOWNLOADER" = "curl" ]; then
+        HTTP_CODE=$(curl -fSL -w "%{http_code}" -o "$ARCHIVE" "$DOWNLOAD_URL" 2>/dev/null) || true
+        if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "302" ]; then
+            rm -rf "$TMPDIR"
+            error "Download failed (HTTP $HTTP_CODE). Check that version '${VERSION}' exists for ${TARGET}.\n  URL: ${DOWNLOAD_URL}"
+        fi
+    else
+        wget -q -O "$ARCHIVE" "$DOWNLOAD_URL" 2>/dev/null || {
+            rm -rf "$TMPDIR"
+            error "Download failed. Check that version '${VERSION}' exists for ${TARGET}.\n  URL: ${DOWNLOAD_URL}"
+        }
+    fi
 fi
 
 # ─── Extract ─────────────────────────────────────────────────────────
@@ -104,10 +118,16 @@ tar xzf "$ARCHIVE" -C "$TMPDIR" 2>/dev/null || {
     error "Failed to extract archive. The download may be corrupted."
 }
 
-# Move binaries to install dir
+# Move binaries to install dir (check both root and subdirectory)
 for bin in coppermoon harbor shipyard; do
+    SRC=""
     if [ -f "${TMPDIR}/${bin}" ]; then
-        mv "${TMPDIR}/${bin}" "${INSTALL_DIR}/${bin}"
+        SRC="${TMPDIR}/${bin}"
+    elif [ -f "${TMPDIR}/coppermoon-${TARGET}/${bin}" ]; then
+        SRC="${TMPDIR}/coppermoon-${TARGET}/${bin}"
+    fi
+    if [ -n "$SRC" ]; then
+        mv "$SRC" "${INSTALL_DIR}/${bin}"
         chmod +x "${INSTALL_DIR}/${bin}"
     fi
 done

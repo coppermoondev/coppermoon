@@ -22,6 +22,7 @@ pub mod string_ext;
 pub mod table_ext;
 pub mod archive;
 pub mod datetime;
+pub mod regex;
 
 use coppermoon_core::Result;
 use mlua::{Lua, Table};
@@ -79,6 +80,9 @@ pub fn register_all(lua: &Lua) -> Result<()> {
 
     // archive module (zip, tar, gzip)
     globals.set("archive", archive::register(lua)?)?;
+
+    // regex module (regular expressions)
+    globals.set("re", regex::register(lua)?)?;
 
     // Extend built-in string table with utility functions
     string_ext::register(lua)?;

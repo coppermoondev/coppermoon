@@ -25,7 +25,22 @@ dist/
 
 # Separate repos
 /crates/harbor/
+/harbor-registry/
+/harbor-registry/** */
 /crates/shipyard/
 /packages/
 /apps/
 .claude/
+
+**/*.tar.gz
+**/*.zip
+**/*.deb
+**/*.rpm
+**/*.msi
+**/*.exe
+**/*.dmg
+**/*.pkg
+**/*.deb
+**/*.rpm
+**/*.msi
+**/*.exe

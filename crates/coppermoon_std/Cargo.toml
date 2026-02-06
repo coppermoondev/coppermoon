@@ -49,3 +49,6 @@ chrono = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
+
+# For regex module
+regex = "1"
