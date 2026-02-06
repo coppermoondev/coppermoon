@@ -5,6 +5,11 @@
 //! mlua's "module" feature use raw_dylib linking that expects lua54.dll at runtime.
 
 fn main() {
+    // On Linux, export Lua symbols from the binary so that native modules
+    // (.so cdylib) loaded via dlopen can resolve lua_type, lua_pushstring, etc.
+    #[cfg(target_os = "linux")]
+    println!("cargo:rustc-link-arg=-Wl,--export-dynamic");
+
     #[cfg(windows)]
     build_lua_shared();
 }
