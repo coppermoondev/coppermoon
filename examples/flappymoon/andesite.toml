@@ -1,0 +1,12 @@
+[app]
+name = "flappymoon"
+version = "1.0.0"
+main = "app.lua"
+
+[window]
+title = "FlappyMoon"
+width = 480
+height = 640
+resizable = true
+min_width = 360
+min_height = 480

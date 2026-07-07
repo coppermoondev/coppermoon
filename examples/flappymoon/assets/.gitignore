@@ -1,0 +1,3 @@
+# Assets générés au premier lancement par lib/assets.lua
+*.wav
+*.bmp
