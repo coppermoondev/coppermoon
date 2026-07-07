@@ -1,0 +1,5 @@
+# Fully self-contained Windows binaries: statically link the MSVC CRT so
+# built apps (andesite bundles, coppermoon) run on machines without the
+# Visual C++ redistributable installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
