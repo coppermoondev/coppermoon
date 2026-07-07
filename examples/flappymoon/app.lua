@@ -40,10 +40,21 @@ local copied = false
 local wing_timer, wing_frame = 0, 0
 local idle_time = 0
 
--- Détection de "pression" (front montant) : key_down/mouse sont des états
+-- Fenêtre de tuning ImGui-style (touche T) : les drag_values sont branchés
+-- en direct sur game.tuning — réglez la gravité en pleine partie !
+local tuning_open = false
+local godmode = false
+local prev_t = false
+local fps_hist = {}
+local frame_i = 0
+
+-- Détection de "pression" (front montant) : key_down/mouse sont des états.
+-- Le clic est ignoré quand l'UI capture le pointeur (fenêtre de tuning).
 local prev_pressed = false
-local function flap_pressed()
-    local now = andesite.input.key_down("space") or andesite.input.mouse().down
+local function flap_pressed(ui)
+    local mouse_ok = not ui:wants_pointer()
+    local now = andesite.input.key_down("space")
+        or (mouse_ok and andesite.input.mouse().down)
     local pressed = now and not prev_pressed
     prev_pressed = now
     return pressed
@@ -121,6 +132,15 @@ end
 
 app:on_frame(function(dt, ui)
     local W, H = ui:available_size()
+
+    -- Historique fps (avant le clamp) + toggle de la fenêtre de tuning
+    frame_i = frame_i + 1
+    fps_hist[#fps_hist + 1] = { frame_i, 1 / math.max(dt, 0.0001) }
+    if #fps_hist > 150 then table.remove(fps_hist, 1) end
+    local t_now = andesite.input.key_down("t")
+    if t_now and not prev_t then tuning_open = not tuning_open end
+    prev_t = t_now
+
     if dt > 0.033 then dt = 0.033 end
 
     -- battement d'ailes : rapide en vol, lent dans les menus
@@ -138,12 +158,12 @@ app:on_frame(function(dt, ui)
         draw_ground(ui, W, H, (idle_time * 60) % 24)
         -- l'oiseau flotte doucement
         draw_bird(ui, W * 0.3, H * 0.42 + math.sin(idle_time * 3) * 9, 0)
-        if flap_pressed() then
+        if flap_pressed(ui) then
             start_game(W, H)
         end
 
     elseif MODE == "play" then
-        if flap_pressed() then
+        if flap_pressed(ui) then
             game.flap(g)
             play("flap", 0.6)
         end
@@ -155,13 +175,13 @@ app:on_frame(function(dt, ui)
         draw_bird(ui, g.bird.x, g.bird.y, game.bird_angle(g))
         draw_score(ui, W)
 
-        if events.died then die() end
+        if events.died and not godmode then die() end
 
     else -- "dead" : scène figée
         draw_pipes(ui, W, H)
         draw_ground(ui, W, H, g.scroll)
         draw_bird(ui, g.bird.x, g.bird.y, 1.25)
-        if flap_pressed() then
+        if flap_pressed(ui) then
             start_game(W, H)
         end
     end
@@ -187,6 +207,10 @@ app:on_ui(function(ui)
         ui:horizontal(function(h)
             h:space(W / 2 - 110)
             h:label("ESPACE ou clic pour voler — record : " .. best)
+        end)
+        ui:horizontal(function(h)
+            h:space(W / 2 - 82)
+            h:colored_label("#e8f7f9aa", "T : fenêtre de tuning (live !)")
         end)
         ui:space(H * 0.42)
         ui:horizontal(function(h)
@@ -227,6 +251,57 @@ app:on_ui(function(ui)
             end
         end)
     end
+
+    -- ------------------------------------------------------------------
+    -- Fenêtre de tuning (T) — l'expérience Dear ImGui : réglages en
+    -- direct, mode invincible, graphe de fps. Disponible dans tous les
+    -- modes, y compris en pleine partie.
+    -- ------------------------------------------------------------------
+    tuning_open = ui:window("Tuning (T)",
+        { open = tuning_open, default_x = 8, default_y = 8, default_width = 300 },
+        function(w)
+            w:grid("tune", function(t)
+                t:label("gravité", "px/s² — accélération vers le bas")
+                game.tuning.gravity = t:drag_value(game.tuning.gravity,
+                    { speed = 10, min = 200, max = 3000 })
+                t:end_row()
+                t:label("impulsion", "vitesse verticale au flap (négatif = vers le haut)")
+                game.tuning.flap_vy = t:drag_value(game.tuning.flap_vy,
+                    { speed = 5, min = -800, max = -100 })
+                t:end_row()
+                t:label("vitesse", "défilement de base, px/s")
+                game.tuning.pipe_speed = t:drag_value(game.tuning.pipe_speed,
+                    { speed = 2, min = 40, max = 500 })
+                t:end_row()
+                t:label("espacement", "distance entre tuyaux")
+                game.tuning.pipe_spacing = t:drag_value(game.tuning.pipe_spacing,
+                    { speed = 2, min = 120, max = 500 })
+                t:end_row()
+                t:label("passage", "hauteur du trou entre les tuyaux")
+                game.tuning.gap_base = t:drag_value(game.tuning.gap_base,
+                    { speed = 2, min = 110, max = 320 })
+                t:end_row()
+                t:label("accélération", "vitesse gagnée par point marqué")
+                game.tuning.speed_ramp = t:drag_value(game.tuning.speed_ramp,
+                    { speed = 0.1, min = 0, max = 10 })
+                t:end_row()
+            end)
+            w:space(4)
+            w:horizontal(function(h)
+                godmode = h:checkbox(godmode, "invincible", "les collisions ne tuent plus")
+                if h:button("réinitialiser", "revenir aux réglages d'origine") then
+                    game.reset_tuning()
+                end
+            end)
+            w:separator()
+            w:plot("fps", { height = 80 }, {
+                { label = "fps", kind = "line", color = "#2ecc71", points = fps_hist },
+            })
+            if g then
+                w:monospace(string.format("score %d · tuyaux %d · vy %+.0f",
+                    g.score, #g.pipes, g.bird.vy))
+            end
+        end)
 end)
 
 app:run()

@@ -3,14 +3,29 @@
 
 local game = {}
 
--- Réglages
-local GRAVITY = 1150       -- px/s²
-local FLAP_VY = -340       -- impulsion de saut, px/s
-local PIPE_SPEED = 155     -- vitesse de défilement de base, px/s
-local PIPE_SPACING = 235   -- distance horizontale entre tuyaux, px
+-- Réglages ajustables en direct via la fenêtre de tuning (touche T)
+local DEFAULTS = {
+    gravity = 1150,      -- px/s²
+    flap_vy = -340,      -- impulsion de saut, px/s
+    pipe_speed = 155,    -- vitesse de défilement de base, px/s
+    pipe_spacing = 235,  -- distance horizontale entre tuyaux, px
+    gap_base = 175,      -- hauteur du passage
+    speed_ramp = 2.5,    -- accélération par point marqué
+}
+
+game.tuning = {}
+
+function game.reset_tuning()
+    for k, v in pairs(DEFAULTS) do
+        game.tuning[k] = v
+    end
+end
+
+game.reset_tuning()
+
+-- Réglages fixes (couplés au rendu)
 local PIPE_WIDTH = 68
-local GAP_BASE = 175       -- hauteur du passage
-local GAP_MIN = 135
+local GAP_MIN = 110
 local BIRD_RADIUS = 14     -- hitbox (le sprite fait 48 px, hitbox plus douce)
 local GROUND_H = 72
 
@@ -24,7 +39,7 @@ function game.new(w, h)
         bird = { x = w * 0.3, y = h * 0.42, vy = 0 },
         pipes = {},          -- { x, gap_y, gap_h, scored }
         score = 0,
-        dist_to_next = PIPE_SPACING * 0.8,
+        dist_to_next = game.tuning.pipe_spacing * 0.8,
         scroll = 0,          -- défilement du sol (visuel)
         time = 0,
     }
@@ -32,16 +47,16 @@ function game.new(w, h)
 end
 
 function game.flap(g)
-    g.bird.vy = FLAP_VY
+    g.bird.vy = game.tuning.flap_vy
 end
 
 --- Vitesse courante : accélère doucement avec le score.
 local function speed(g)
-    return PIPE_SPEED + math.min(60, g.score * 2.5)
+    return game.tuning.pipe_speed + math.min(60, g.score * game.tuning.speed_ramp)
 end
 
 local function spawn_pipe(g, w, h)
-    local gap_h = math.max(GAP_MIN, GAP_BASE - g.score * 1.5)
+    local gap_h = math.max(GAP_MIN, game.tuning.gap_base - g.score * 1.5)
     local margin = 60
     local playable = h - GROUND_H
     local gap_y = margin + math.random() * (playable - gap_h - margin * 2)
@@ -64,7 +79,7 @@ function game.update(g, dt, w, h)
     g.scroll = (g.scroll + v * dt) % 24
 
     -- Oiseau
-    g.bird.vy = g.bird.vy + GRAVITY * dt
+    g.bird.vy = g.bird.vy + game.tuning.gravity * dt
     g.bird.y = g.bird.y + g.bird.vy * dt
     g.bird.x = w * 0.3
 
@@ -81,7 +96,7 @@ function game.update(g, dt, w, h)
     g.dist_to_next = g.dist_to_next - v * dt
     if g.dist_to_next <= 0 then
         spawn_pipe(g, w, h)
-        g.dist_to_next = g.dist_to_next + PIPE_SPACING
+        g.dist_to_next = g.dist_to_next + game.tuning.pipe_spacing
     end
 
     for i = #g.pipes, 1, -1 do

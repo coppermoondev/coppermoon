@@ -10,7 +10,9 @@ andesite build examples/flappymoon    # → dist/flappymoon.exe autonome
 andesite package examples/flappymoon  # → dist/flappymoon-setup.exe installable
 ```
 
-**Contrôles** : `ESPACE` ou clic gauche.
+**Contrôles** : `ESPACE` ou clic gauche. **`T`** ouvre la fenêtre de tuning
+façon Dear ImGui : gravité, impulsion, vitesse, espacement… réglables **en
+pleine partie**, mode invincible, graphe de fps en direct.
 
 ## Ce que l'exemple montre
 
@@ -24,6 +26,8 @@ andesite package examples/flappymoon  # → dist/flappymoon-setup.exe installabl
 | `andesite.notify` | toast système sur nouveau record |
 | `andesite.clipboard` | bouton « Copier le score » |
 | `app:on_ui(ui)` | menus en widgets par-dessus la scène |
+| `ui:window` + `grid` + `drag_value` + `plot` | fenêtre de tuning flottante (T) : réglages live + fps |
+| `ui:wants_pointer()` | le clic dans la fenêtre de tuning ne fait pas voler l'oiseau |
 | `require` + `lib/` | logique de jeu séparée du rendu |
 
 ## Zéro asset binaire dans le repo
