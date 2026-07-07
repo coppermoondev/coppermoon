@@ -67,12 +67,53 @@ Modules globaux disponibles directement:
 - `crypto`
 - `time`
 - `http` (avec `http.server`)
-- `net` (avec `net.ws`)
+- `net` (voir API complete ci-dessous)
 - `buffer`
 - `term`
 - `console`
 - `archive`
 - `re`
+
+### API `net` (sockets TCP/UDP, client et serveur)
+
+Tout est async transparent : chaque I/O suspend sa coroutine, l'event loop
+continue de servir. Les timeouts se reglent par socket via `set_timeout(ms)`.
+
+TCP client — `local c = net.tcp.connect(host, port, timeout_ms?)` :
+- `c:read(n?)`, `c:read_line()`, `c:read_all()`, `c:read_exact(n)`,
+  `c:read_until(delim)`, `c:peek(n?)`
+- `c:write(data)`, `c:write_all(data)`, `c:flush()`, `c:close()`
+- `c:set_timeout(ms)`, `c:set_nodelay(bool)`, `c:set_ttl(n)`
+- `c:peer_addr()`, `c:local_addr()`
+
+TCP serveur — `local s = net.tcp.listen(host?, port)` (host defaut `0.0.0.0`) :
+- `s:serve(function(conn, ip, port) ... end)` — boucle accept, un handler
+  concurrent par connexion (jamais bloquant), ne retourne pas
+- `s:accept()` -> `conn, peer_ip, peer_port` (accept manuel)
+- `s:local_addr()`
+
+UDP — `local u = net.udp.bind(host?, port)` :
+- `u:send(data, host, port)`, `u:recv(n?)` -> `data, ip, port`
+- `u:connect(host, port)`, `u:send_connected(data)`, `u:peer_addr()`
+- `u:set_timeout(ms)`, `u:set_broadcast(bool)`, `u:set_ttl(n)`
+- multicast : `u:join_multicast(group, iface?)`, `u:leave_multicast(...)`,
+  `u:set_multicast_loop(bool)`
+
+Utilitaire : `net.resolve(hostname)` -> table d'IP.
+
+Exemple serveur echo :
+
+```lua
+local s = net.tcp.listen("127.0.0.1", 9000)
+print("echo sur " .. s:local_addr())
+s:serve(function(conn, ip)
+    while true do
+        local line = conn:read_line()
+        if line == "" then break end   -- pair deconnecte
+        conn:write_all(line)
+    end
+end)
+```
 
 Fonctions/valeurs globales utiles:
 

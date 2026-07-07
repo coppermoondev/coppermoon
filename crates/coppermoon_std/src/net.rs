@@ -7,6 +7,7 @@
 
 use coppermoon_core::Result;
 use mlua::{Lua, Table, UserData, UserDataMethods};
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -140,6 +141,56 @@ impl UserData for TcpConnection {
             }
         });
 
+        // conn:read_exact(n) -> string — reads exactly n bytes, erroring on
+        // early EOF. Essential for length-prefixed / fixed-frame protocols.
+        methods.add_async_method("read_exact", |lua, this, n: usize| {
+            let stream = Arc::clone(&this.stream);
+            let timeout = get_timeout(&this.timeout);
+            drop(this);
+            async move {
+                let timeout = timeout?;
+                let mut stream = stream.lock().await;
+                let mut buffer = vec![0u8; n];
+                io_with_timeout(timeout, "Read", stream.read_exact(&mut buffer)).await?;
+                lua.create_string(&buffer)
+            }
+        });
+
+        // conn:read_until(delimiter) -> string — reads up to and including
+        // the first byte of `delimiter` (e.g. "\0"). Empty string on EOF.
+        methods.add_async_method("read_until", |lua, this, delim: mlua::String| {
+            let stream = Arc::clone(&this.stream);
+            let timeout = get_timeout(&this.timeout);
+            drop(this);
+            async move {
+                let timeout = timeout?;
+                let byte = *delim.as_bytes().first().ok_or_else(|| {
+                    mlua::Error::runtime("read_until: delimiter must be a non-empty string")
+                })?;
+                let mut stream = stream.lock().await;
+                let mut buffer = Vec::new();
+                io_with_timeout(timeout, "Read", stream.read_until(byte, &mut buffer)).await?;
+                lua.create_string(&buffer)
+            }
+        });
+
+        // conn:peek(n) -> string — returns bytes without consuming them.
+        methods.add_async_method("peek", |lua, this, n: Option<usize>| {
+            let stream = Arc::clone(&this.stream);
+            let timeout = get_timeout(&this.timeout);
+            drop(this);
+            async move {
+                let timeout = timeout?;
+                let n = n.unwrap_or(4096);
+                let stream = stream.lock().await;
+                let mut buffer = vec![0u8; n];
+                let peeked =
+                    io_with_timeout(timeout, "Peek", stream.get_ref().peek(&mut buffer)).await?;
+                buffer.truncate(peeked);
+                lua.create_string(&buffer)
+            }
+        });
+
         // conn:write(data) -> bytes_written
         methods.add_async_method("write", |_, this, data: mlua::String| {
             let stream = Arc::clone(&this.stream);
@@ -208,6 +259,35 @@ impl UserData for TcpConnection {
             Ok(())
         });
 
+        // conn:set_nodelay(bool) — toggle TCP_NODELAY (disable Nagle's
+        // algorithm) for low-latency request/response protocols.
+        methods.add_async_method("set_nodelay", |_, this, on: bool| {
+            let stream = Arc::clone(&this.stream);
+            drop(this);
+            async move {
+                let stream = stream.lock().await;
+                stream
+                    .get_ref()
+                    .set_nodelay(on)
+                    .map_err(|e| mlua::Error::runtime(format!("Set nodelay error: {}", e)))?;
+                Ok(())
+            }
+        });
+
+        // conn:set_ttl(n) — IP time-to-live for outgoing packets.
+        methods.add_async_method("set_ttl", |_, this, ttl: u32| {
+            let stream = Arc::clone(&this.stream);
+            drop(this);
+            async move {
+                let stream = stream.lock().await;
+                stream
+                    .get_ref()
+                    .set_ttl(ttl)
+                    .map_err(|e| mlua::Error::runtime(format!("Set ttl error: {}", e)))?;
+                Ok(())
+            }
+        });
+
         // conn:peer_addr() -> string
         methods.add_async_method("peer_addr", |_, this, _: ()| {
             let stream = Arc::clone(&this.stream);
@@ -238,11 +318,22 @@ impl UserData for TcpConnection {
     }
 }
 
-async fn tcp_connect(_: Lua, (host, port): (String, u16)) -> mlua::Result<TcpConnection> {
+/// net.tcp.connect(host, port, timeout_ms?) -> connection
+async fn tcp_connect(
+    _: Lua,
+    (host, port, timeout_ms): (String, u16, Option<u64>),
+) -> mlua::Result<TcpConnection> {
     let addr = format!("{}:{}", host, port);
-    let stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| mlua::Error::runtime(format!("Connect error: {}", e)))?;
+    let fut = TcpStream::connect(&addr);
+    let stream = match timeout_ms {
+        Some(ms) => tokio::time::timeout(Duration::from_millis(ms), fut)
+            .await
+            .map_err(|_| mlua::Error::runtime("Connect error: timed out"))?
+            .map_err(|e| mlua::Error::runtime(format!("Connect error: {}", e)))?,
+        None => fut
+            .await
+            .map_err(|e| mlua::Error::runtime(format!("Connect error: {}", e)))?,
+    };
 
     Ok(TcpConnection::new(stream))
 }
@@ -256,7 +347,7 @@ struct TcpServer {
 
 impl UserData for TcpServer {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        // server:accept() -> connection
+        // server:accept() -> connection, peer_ip, peer_port
         // Same invariant as TcpConnection: drop `this` before awaiting so
         // other coroutines can still use this server object (local_addr,
         // a second accept, …) while this accept is pending.
@@ -264,12 +355,49 @@ impl UserData for TcpServer {
             let listener = Arc::clone(&this.listener);
             drop(this);
             async move {
-                let (stream, _addr) = listener
+                let (stream, addr) = listener
                     .accept()
                     .await
                     .map_err(|e| mlua::Error::runtime(format!("Accept error: {}", e)))?;
 
-                Ok(TcpConnection::new(stream))
+                Ok((TcpConnection::new(stream), addr.ip().to_string(), addr.port()))
+            }
+        });
+
+        // server:serve(handler) — accept loop: each accepted connection is
+        // handed to `handler(conn, peer_ip, peer_port)` on its own coroutine,
+        // so connections are served concurrently on the single event-loop
+        // thread. Never returns (runs until the process exits). Handler
+        // errors go through the uncaught-error policy (process.on_error).
+        methods.add_async_method("serve", |lua, this, handler: mlua::Function| {
+            let listener = Arc::clone(&this.listener);
+            drop(this);
+            async move {
+                loop {
+                    let (stream, addr) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("Accept error: {}", e);
+                            continue;
+                        }
+                    };
+                    let handler = handler.clone();
+                    let lua = lua.clone();
+                    tokio::task::spawn_local(async move {
+                        let conn = match lua.create_userdata(TcpConnection::new(stream)) {
+                            Ok(ud) => ud,
+                            Err(_) => return,
+                        };
+                        let args = (conn, addr.ip().to_string(), addr.port());
+                        if let Err(e) = handler.call_async::<()>(args).await {
+                            coppermoon_core::uncaught::report(&lua, "net.tcp serve", &e).await;
+                        }
+                    });
+                }
+                // `loop` above never breaks; this pins the future's output
+                // type so mlua can infer the method's return type.
+                #[allow(unreachable_code)]
+                Ok::<(), mlua::Error>(())
             }
         });
 
@@ -407,6 +535,15 @@ impl UserData for UdpConnection {
             Ok(addr.to_string())
         });
 
+        // udp:peer_addr() -> string (for connected sockets)
+        methods.add_method("peer_addr", |_, this, _: ()| {
+            let addr = this
+                .socket
+                .peer_addr()
+                .map_err(|e| mlua::Error::runtime(format!("Peer addr error: {}", e)))?;
+            Ok(addr.to_string())
+        });
+
         // udp:set_broadcast(bool)
         methods.add_method("set_broadcast", |_, this, broadcast: bool| {
             this.socket
@@ -415,7 +552,56 @@ impl UserData for UdpConnection {
 
             Ok(())
         });
+
+        // udp:set_ttl(n)
+        methods.add_method("set_ttl", |_, this, ttl: u32| {
+            this.socket
+                .set_ttl(ttl)
+                .map_err(|e| mlua::Error::runtime(format!("Set ttl error: {}", e)))?;
+            Ok(())
+        });
+
+        // udp:set_multicast_loop(bool) — whether multicast packets loop back
+        // to the local socket.
+        methods.add_method("set_multicast_loop", |_, this, on: bool| {
+            this.socket
+                .set_multicast_loop_v4(on)
+                .map_err(|e| mlua::Error::runtime(format!("Set multicast loop error: {}", e)))?;
+            Ok(())
+        });
+
+        // udp:join_multicast(group, interface?) — subscribe to an IPv4
+        // multicast group (e.g. "239.0.0.1"); interface defaults to 0.0.0.0.
+        methods.add_method(
+            "join_multicast",
+            |_, this, (group, interface): (String, Option<String>)| {
+                let group = parse_ipv4(&group, "multicast group")?;
+                let iface = parse_ipv4(interface.as_deref().unwrap_or("0.0.0.0"), "interface")?;
+                this.socket
+                    .join_multicast_v4(group, iface)
+                    .map_err(|e| mlua::Error::runtime(format!("Join multicast error: {}", e)))?;
+                Ok(())
+            },
+        );
+
+        // udp:leave_multicast(group, interface?)
+        methods.add_method(
+            "leave_multicast",
+            |_, this, (group, interface): (String, Option<String>)| {
+                let group = parse_ipv4(&group, "multicast group")?;
+                let iface = parse_ipv4(interface.as_deref().unwrap_or("0.0.0.0"), "interface")?;
+                this.socket
+                    .leave_multicast_v4(group, iface)
+                    .map_err(|e| mlua::Error::runtime(format!("Leave multicast error: {}", e)))?;
+                Ok(())
+            },
+        );
     }
+}
+
+fn parse_ipv4(s: &str, what: &str) -> mlua::Result<Ipv4Addr> {
+    s.parse::<Ipv4Addr>()
+        .map_err(|_| mlua::Error::runtime(format!("Invalid {} address: '{}'", what, s)))
 }
 
 async fn udp_bind(_: Lua, (host, port): (Option<String>, u16)) -> mlua::Result<UdpConnection> {
