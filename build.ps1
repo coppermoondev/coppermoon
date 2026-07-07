@@ -18,7 +18,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Repo = "coppermoondev/coppermoon"
-$Binaries = @("coppermoon", "harbor", "shipyard")
+$Binaries = @("coppermoon", "harbor", "shipyard", "quarry", "andesite")
 $DistDir = "dist"
 
 # Detect platform

@@ -119,7 +119,7 @@ tar xzf "$ARCHIVE" -C "$TMPDIR" 2>/dev/null || {
 }
 
 # Move binaries to install dir (check both root and subdirectory)
-for bin in coppermoon harbor shipyard quarry; do
+for bin in coppermoon harbor shipyard quarry andesite; do
     SRC=""
     if [ -f "${TMPDIR}/${bin}" ]; then
         SRC="${TMPDIR}/${bin}"

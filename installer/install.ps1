@@ -83,7 +83,7 @@ try {
 }
 
 # Move binaries to install dir
-$Binaries = @("coppermoon.exe", "harbor.exe", "shipyard.exe", "quarry.exe")
+$Binaries = @("coppermoon.exe", "harbor.exe", "shipyard.exe", "quarry.exe", "andesite.exe")
 foreach ($bin in $Binaries) {
     # Check root and subdirectories
     $found = Get-ChildItem -Path $TmpDir -Filter $bin -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
