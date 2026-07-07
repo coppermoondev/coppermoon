@@ -2,12 +2,22 @@
 //!
 //! Provides MySQL and MariaDB database bindings for CopperMoon Lua runtime.
 //! This module provides a compatible interface with the SQLite module.
+//!
+//! All database operations run on the Tokio blocking thread pool via
+//! `tokio::task::spawn_blocking`, so they never block the Lua event loop:
+//! while a statement executes, other coroutines (HTTP handlers, timers, …)
+//! keep running. From Lua's perspective the API is still synchronous.
+//!
+//! Pattern (see also `coppermoon_std/src/http.rs` and `crates/sqlite`):
+//! 1. Parse Lua arguments into plain Rust data on the Lua thread.
+//! 2. Run the MySQL work inside `spawn_blocking` (no Lua access there).
+//! 3. Convert results back into Lua values after the `.await`, on the Lua thread.
 
 use mlua::{FromLua, Lua, MultiValue, Result, Table, UserData, UserDataMethods, Value};
 use mysql::prelude::*;
-use mysql::{Conn, Opts, OptsBuilder, Pool, PooledConn, Row as MySqlRow};
-use std::cell::RefCell;
-use std::sync::Arc;
+use mysql::{Opts, OptsBuilder, Pool, PooledConn, Row as MySqlRow};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// MySQL error types
 #[derive(Debug, thiserror::Error)]
@@ -23,11 +33,23 @@ pub enum MysqlError {
 }
 
 /// MySQL Database connection wrapper
+///
+/// A single pooled connection is shared behind an `Arc<Mutex<..>>` so it can
+/// be moved into `spawn_blocking` closures (`PooledConn` is `Send`). Keeping
+/// one persistent connection (instead of grabbing a fresh one from the pool
+/// per call) preserves the transaction semantics of `begin`/`commit`/
+/// `rollback`, which must all run on the same connection.
+///
+/// Every field is `Arc`-wrapped so async methods can clone what they need and
+/// release the userdata borrow (`drop(this)`) BEFORE the first `.await`:
+/// mlua userdata borrows are exclusive, so holding `this` across an await
+/// would make any reentrant or concurrent access to the same object fail
+/// with "error borrowing userdata" (e.g. a `transaction` callback calling
+/// `db:execute`).
 pub struct Database {
-    pool: Arc<Pool>,
-    conn: RefCell<PooledConn>,
-    last_insert_id: RefCell<u64>,
-    affected_rows: RefCell<u64>,
+    conn: Arc<Mutex<PooledConn>>,
+    last_insert_id: Arc<AtomicU64>,
+    affected_rows: Arc<AtomicU64>,
 }
 
 /// Connection options for MySQL
@@ -72,12 +94,7 @@ impl Database {
         let pool = Pool::new(opts)?;
         let conn = pool.get_conn()?;
 
-        Ok(Self {
-            pool: Arc::new(pool),
-            conn: RefCell::new(conn),
-            last_insert_id: RefCell::new(0),
-            affected_rows: RefCell::new(0),
-        })
+        Ok(Self::from_conn(conn))
     }
 
     /// Open a database connection with URL
@@ -86,206 +103,268 @@ impl Database {
         let pool = Pool::new(opts)?;
         let conn = pool.get_conn()?;
 
-        Ok(Self {
-            pool: Arc::new(pool),
-            conn: RefCell::new(conn),
-            last_insert_id: RefCell::new(0),
-            affected_rows: RefCell::new(0),
-        })
+        Ok(Self::from_conn(conn))
     }
 
-    /// Get a fresh connection from the pool
-    fn get_conn(&self) -> std::result::Result<PooledConn, mysql::Error> {
-        self.pool.get_conn()
+    fn from_conn(conn: PooledConn) -> Self {
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            last_insert_id: Arc::new(AtomicU64::new(0)),
+            affected_rows: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
+/// Lock the shared connection, mapping poisoning to a Lua error.
+fn lock_conn(conn: &Mutex<PooledConn>) -> Result<MutexGuard<'_, PooledConn>> {
+    conn.lock()
+        .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))
+}
+
+/// Run a blocking closure on the Tokio blocking pool.
+///
+/// The closure must not touch Lua: it works on plain Rust data only.
+async fn run_blocking<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| mlua::Error::runtime(format!("Blocking task failed: {}", e)))?
+}
+
+/// Extract one MySQL row into thread-safe `(column, value)` pairs.
+fn row_to_pairs(row: &MySqlRow) -> Vec<(String, mysql::Value)> {
+    row.columns_ref()
+        .iter()
+        .enumerate()
+        .map(|(col_idx, column)| {
+            let col_name = column.name_str().to_string();
+            let value: mysql::Value = row.get(col_idx).unwrap_or(mysql::Value::NULL);
+            (col_name, value)
+        })
+        .collect()
+}
+
+/// Build a Lua table from a row's `(column, value)` pairs (Lua thread only).
+fn row_to_table(lua: &Lua, row: Vec<(String, mysql::Value)>) -> Result<Table> {
+    let row_table = lua.create_table()?;
+    for (name, value) in row {
+        let lua_value = mysql_value_to_lua(&value, lua)?;
+        row_table.set(name, lua_value)?;
+    }
+    Ok(row_table)
+}
+
+/// Parse `(sql, params...)` from a Lua MultiValue (Lua thread only).
+fn parse_sql_args(lua: &Lua, args: MultiValue) -> Result<(String, Vec<mysql::Value>)> {
+    let mut args_iter = args.into_iter();
+
+    // First argument is SQL
+    let sql: String = match args_iter.next() {
+        Some(Value::String(s)) => s.to_str()?.to_string(),
+        _ => return Err(mlua::Error::external("First argument must be SQL string")),
+    };
+
+    // Remaining arguments are parameters, converted to plain mysql::Value
+    // so they can be moved into a spawn_blocking closure.
+    let params: Vec<mysql::Value> = args_iter
+        .map(|v| MysqlValue::from_lua(v, lua).map(|p| p.to_mysql()))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((sql, params))
+}
+
+/// Plain-Rust column description extracted inside `spawn_blocking`.
+struct ColumnInfo {
+    cid: i64,
+    name: String,
+    col_type: String,
+    full_type: String,
+    notnull: bool,
+    default: Option<String>,
+    pk: bool,
+    extra: String,
+}
+
 impl UserData for Database {
+    // INVARIANT (all async methods): mlua userdata borrows are exclusive, so
+    // clone the needed Arc fields and `drop(this)` BEFORE the first `.await`.
+    // Holding `this` across an await would break reentrant/concurrent access
+    // to the same object ("error borrowing userdata").
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         // Execute a SQL statement (INSERT, UPDATE, DELETE, CREATE, etc.)
-        methods.add_method("exec", |_lua, this, sql: String| {
-            let mut conn = this.conn.borrow_mut();
-            match conn.query_drop(&sql) {
-                Ok(_) => {
-                    let affected = conn.affected_rows();
-                    *this.affected_rows.borrow_mut() = affected;
-                    Ok(Value::Integer(affected as i64))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
-            }
+        methods.add_async_method("exec", |_lua, this, sql: String| async move {
+            let conn = this.conn.clone();
+            let affected_rows = this.affected_rows.clone();
+            drop(this);
+
+            let affected = run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
+                conn.query_drop(&sql).map_err(mlua::Error::external)?;
+                Ok(conn.affected_rows())
+            })
+            .await?;
+
+            affected_rows.store(affected, Ordering::Relaxed);
+            Ok(Value::Integer(affected as i64))
         });
 
         // Execute a SQL statement with parameters
-        methods.add_method("execute", |lua, this, args: MultiValue| {
-            let mut args_iter = args.into_iter();
+        methods.add_async_method("execute", |lua, this, args: MultiValue| async move {
+            let (sql, params) = parse_sql_args(&lua, args)?;
 
-            // First argument is SQL
-            let sql: String = match args_iter.next() {
-                Some(Value::String(s)) => s.to_str()?.to_string(),
-                _ => return Err(mlua::Error::external("First argument must be SQL string")),
-            };
+            let conn = this.conn.clone();
+            let affected_rows = this.affected_rows.clone();
+            let last_insert_id = this.last_insert_id.clone();
+            drop(this);
 
-            // Remaining arguments are parameters
-            let params: Vec<MysqlValue> = args_iter
-                .map(|v| MysqlValue::from_lua(v, lua))
-                .collect::<Result<Vec<_>>>()?;
+            let (affected, last_id) = run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
+                conn.exec_drop(&sql, params).map_err(mlua::Error::external)?;
+                Ok((conn.affected_rows(), conn.last_insert_id()))
+            })
+            .await?;
 
-            let mut conn = this.conn.borrow_mut();
-
-            // Convert params to mysql::Value
-            let mysql_params: Vec<mysql::Value> = params.iter().map(|p| p.to_mysql()).collect();
-
-            match conn.exec_drop(&sql, mysql_params) {
-                Ok(_) => {
-                    let affected = conn.affected_rows();
-                    let last_id = conn.last_insert_id();
-                    *this.affected_rows.borrow_mut() = affected;
-                    *this.last_insert_id.borrow_mut() = last_id;
-                    Ok(Value::Integer(affected as i64))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
-            }
+            affected_rows.store(affected, Ordering::Relaxed);
+            last_insert_id.store(last_id, Ordering::Relaxed);
+            Ok(Value::Integer(affected as i64))
         });
 
         // Query and return all rows
-        methods.add_method("query", |lua, this, args: MultiValue| {
-            let mut args_iter = args.into_iter();
+        methods.add_async_method("query", |lua, this, args: MultiValue| async move {
+            let (sql, params) = parse_sql_args(&lua, args)?;
 
-            // First argument is SQL
-            let sql: String = match args_iter.next() {
-                Some(Value::String(s)) => s.to_str()?.to_string(),
-                _ => return Err(mlua::Error::external("First argument must be SQL string")),
-            };
+            let conn = this.conn.clone();
+            drop(this);
 
-            // Remaining arguments are parameters
-            let params: Vec<MysqlValue> = args_iter
-                .map(|v| MysqlValue::from_lua(v, lua))
-                .collect::<Result<Vec<_>>>()?;
+            let rows: Vec<Vec<(String, mysql::Value)>> = run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
+                let rows: Vec<MySqlRow> =
+                    conn.exec(&sql, params).map_err(mlua::Error::external)?;
+                Ok(rows.iter().map(row_to_pairs).collect())
+            })
+            .await?;
 
-            let mut conn = this.conn.borrow_mut();
-            let mysql_params: Vec<mysql::Value> = params.iter().map(|p| p.to_mysql()).collect();
-
-            let rows: std::result::Result<Vec<MySqlRow>, mysql::Error> =
-                conn.exec(&sql, mysql_params);
-
-            match rows {
-                Ok(rows) => {
-                    let result = lua.create_table()?;
-
-                    for (idx, row) in rows.iter().enumerate() {
-                        let row_table = lua.create_table()?;
-
-                        // Get column names and values
-                        for (col_idx, column) in row.columns_ref().iter().enumerate() {
-                            let col_name = column.name_str().to_string();
-                            let value: mysql::Value = row.get(col_idx).unwrap_or(mysql::Value::NULL);
-                            let lua_value = mysql_value_to_lua(&value, lua)?;
-                            row_table.set(col_name, lua_value)?;
-                        }
-
-                        result.set(idx + 1, row_table)?;
-                    }
-
-                    Ok(Value::Table(result))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
+            // Build Lua tables on the Lua thread, after the blocking work.
+            let result = lua.create_table()?;
+            for (idx, row) in rows.into_iter().enumerate() {
+                result.set(idx + 1, row_to_table(&lua, row)?)?;
             }
+
+            Ok(Value::Table(result))
         });
 
         // Query and return first row only
-        methods.add_method("query_row", |lua, this, args: MultiValue| {
-            let mut args_iter = args.into_iter();
+        methods.add_async_method("query_row", |lua, this, args: MultiValue| async move {
+            let (sql, params) = parse_sql_args(&lua, args)?;
 
-            let sql: String = match args_iter.next() {
-                Some(Value::String(s)) => s.to_str()?.to_string(),
-                _ => return Err(mlua::Error::external("First argument must be SQL string")),
-            };
+            let conn = this.conn.clone();
+            drop(this);
 
-            let params: Vec<MysqlValue> = args_iter
-                .map(|v| MysqlValue::from_lua(v, lua))
-                .collect::<Result<Vec<_>>>()?;
+            let row: Option<Vec<(String, mysql::Value)>> = run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
+                let row: Option<MySqlRow> = conn
+                    .exec_first(&sql, params)
+                    .map_err(mlua::Error::external)?;
+                Ok(row.as_ref().map(row_to_pairs))
+            })
+            .await?;
 
-            let mut conn = this.conn.borrow_mut();
-            let mysql_params: Vec<mysql::Value> = params.iter().map(|p| p.to_mysql()).collect();
-
-            let result: std::result::Result<Option<MySqlRow>, mysql::Error> =
-                conn.exec_first(&sql, mysql_params);
-
-            match result {
-                Ok(Some(row)) => {
-                    let row_table = lua.create_table()?;
-
-                    for (col_idx, column) in row.columns_ref().iter().enumerate() {
-                        let col_name = column.name_str().to_string();
-                        let value: mysql::Value = row.get(col_idx).unwrap_or(mysql::Value::NULL);
-                        let lua_value = mysql_value_to_lua(&value, lua)?;
-                        row_table.set(col_name, lua_value)?;
-                    }
-
-                    Ok(Value::Table(row_table))
-                }
-                Ok(None) => Ok(Value::Nil),
-                Err(e) => Err(mlua::Error::external(e)),
+            match row {
+                Some(row) => Ok(Value::Table(row_to_table(&lua, row)?)),
+                None => Ok(Value::Nil),
             }
         });
 
         // Get last insert id
         methods.add_method("last_insert_id", |_, this, ()| {
-            Ok(*this.last_insert_id.borrow() as i64)
+            Ok(this.last_insert_id.load(Ordering::Relaxed) as i64)
         });
 
         // Alias for compatibility
         methods.add_method("last_insert_rowid", |_, this, ()| {
-            Ok(*this.last_insert_id.borrow() as i64)
+            Ok(this.last_insert_id.load(Ordering::Relaxed) as i64)
         });
 
         // Get changes count from last statement
         methods.add_method("changes", |_, this, ()| {
-            Ok(*this.affected_rows.borrow() as i64)
+            Ok(this.affected_rows.load(Ordering::Relaxed) as i64)
         });
 
         // Begin transaction
-        methods.add_method("begin", |_, this, ()| {
-            let mut conn = this.conn.borrow_mut();
-            conn.query_drop("START TRANSACTION")
-                .map_err(mlua::Error::external)?;
-            Ok(())
+        methods.add_async_method("begin", |_, this, ()| async move {
+            let conn = this.conn.clone();
+            drop(this);
+
+            run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
+                conn.query_drop("START TRANSACTION")
+                    .map_err(mlua::Error::external)
+            })
+            .await
         });
 
         // Commit transaction
-        methods.add_method("commit", |_, this, ()| {
-            let mut conn = this.conn.borrow_mut();
-            conn.query_drop("COMMIT")
-                .map_err(mlua::Error::external)?;
-            Ok(())
+        methods.add_async_method("commit", |_, this, ()| async move {
+            let conn = this.conn.clone();
+            drop(this);
+
+            run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
+                conn.query_drop("COMMIT").map_err(mlua::Error::external)
+            })
+            .await
         });
 
         // Rollback transaction
-        methods.add_method("rollback", |_, this, ()| {
-            let mut conn = this.conn.borrow_mut();
-            conn.query_drop("ROLLBACK")
-                .map_err(mlua::Error::external)?;
-            Ok(())
+        methods.add_async_method("rollback", |_, this, ()| async move {
+            let conn = this.conn.clone();
+            drop(this);
+
+            run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
+                conn.query_drop("ROLLBACK").map_err(mlua::Error::external)
+            })
+            .await
         });
 
-        // Transaction helper
-        methods.add_method("transaction", |_lua, this, func: mlua::Function| {
-            {
-                let mut conn = this.conn.borrow_mut();
-                conn.query_drop("START TRANSACTION")
-                    .map_err(mlua::Error::external)?;
-            }
+        // Transaction helper: START TRANSACTION, call func, COMMIT on success /
+        // ROLLBACK on error. The Lua callback runs on the Lua thread via
+        // `call_async` (never inside spawn_blocking); only the SQL statements
+        // go through the blocking pool.
+        //
+        // `this` is dropped before any await so the callback can re-borrow the
+        // same userdata (e.g. call `db:execute`) without a borrow conflict.
+        methods.add_async_method("transaction", |_lua, this, func: mlua::Function| async move {
+            let conn = this.conn.clone();
+            drop(this);
 
-            match func.call::<()>(()) {
+            let begin_conn = conn.clone();
+            run_blocking(move || {
+                let mut conn = lock_conn(&begin_conn)?;
+                conn.query_drop("START TRANSACTION")
+                    .map_err(mlua::Error::external)
+            })
+            .await?;
+
+            match func.call_async::<()>(()).await {
                 Ok(_) => {
-                    let mut conn = this.conn.borrow_mut();
-                    conn.query_drop("COMMIT")
-                        .map_err(mlua::Error::external)?;
+                    run_blocking(move || {
+                        let mut conn = lock_conn(&conn)?;
+                        conn.query_drop("COMMIT").map_err(mlua::Error::external)
+                    })
+                    .await?;
                     Ok(true)
                 }
                 Err(e) => {
-                    let mut conn = this.conn.borrow_mut();
-                    let _ = conn.query_drop("ROLLBACK");
+                    let _ = run_blocking(move || {
+                        let mut conn = lock_conn(&conn)?;
+                        let _ = conn.query_drop("ROLLBACK");
+                        Ok(())
+                    })
+                    .await;
                     Err(e)
                 }
             }
@@ -298,129 +377,156 @@ impl UserData for Database {
         });
 
         // Check if table exists
-        methods.add_method("table_exists", |_, this, table_name: String| {
-            let mut conn = this.conn.borrow_mut();
+        methods.add_async_method("table_exists", |_, this, table_name: String| async move {
+            let conn = this.conn.clone();
+            drop(this);
 
-            let sql = "SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?";
-            let result: std::result::Result<Option<MySqlRow>, mysql::Error> =
-                conn.exec_first(sql, (table_name,));
+            run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
 
-            match result {
-                Ok(Some(row)) => {
-                    let count: i64 = row.get("cnt").unwrap_or(0);
-                    Ok(count > 0)
-                }
-                Ok(None) => Ok(false),
-                Err(e) => Err(mlua::Error::external(e)),
-            }
+                let sql = "SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?";
+                let row: Option<MySqlRow> = conn
+                    .exec_first(sql, (table_name,))
+                    .map_err(mlua::Error::external)?;
+
+                Ok(match row {
+                    Some(row) => row.get::<i64, _>("cnt").unwrap_or(0) > 0,
+                    None => false,
+                })
+            })
+            .await
         });
 
         // Get table info (columns)
-        methods.add_method("table_info", |lua, this, table_name: String| {
-            let mut conn = this.conn.borrow_mut();
+        methods.add_async_method("table_info", |lua, this, table_name: String| async move {
+            let conn = this.conn.clone();
+            drop(this);
 
-            let sql = r#"
-                SELECT
-                    ORDINAL_POSITION as cid,
-                    COLUMN_NAME as name,
-                    DATA_TYPE as type,
-                    IS_NULLABLE = 'NO' as notnull,
-                    COLUMN_DEFAULT as `default`,
-                    COLUMN_KEY = 'PRI' as pk,
-                    COLUMN_TYPE as full_type,
-                    EXTRA as extra
-                FROM information_schema.columns
-                WHERE table_schema = DATABASE() AND table_name = ?
-                ORDER BY ORDINAL_POSITION
-            "#;
+            let columns: Vec<ColumnInfo> = run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
 
-            let rows: std::result::Result<Vec<MySqlRow>, mysql::Error> =
-                conn.exec(sql, (table_name,));
+                let sql = r#"
+                    SELECT
+                        ORDINAL_POSITION as cid,
+                        COLUMN_NAME as name,
+                        DATA_TYPE as type,
+                        IS_NULLABLE = 'NO' as notnull,
+                        COLUMN_DEFAULT as `default`,
+                        COLUMN_KEY = 'PRI' as pk,
+                        COLUMN_TYPE as full_type,
+                        EXTRA as extra
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE() AND table_name = ?
+                    ORDER BY ORDINAL_POSITION
+                "#;
 
-            match rows {
-                Ok(rows) => {
-                    let result = lua.create_table()?;
+                let rows: Vec<MySqlRow> = conn
+                    .exec(sql, (table_name,))
+                    .map_err(mlua::Error::external)?;
 
-                    for (idx, row) in rows.iter().enumerate() {
-                        let col_table = lua.create_table()?;
+                Ok(rows
+                    .iter()
+                    .map(|row| ColumnInfo {
+                        cid: row.get("cid").unwrap_or(0),
+                        name: row.get("name").unwrap_or_default(),
+                        col_type: row.get("type").unwrap_or_default(),
+                        full_type: row.get("full_type").unwrap_or_default(),
+                        notnull: row.get::<i64, _>("notnull").unwrap_or(0) != 0,
+                        default: row.get("default"),
+                        pk: row.get::<i64, _>("pk").unwrap_or(0) != 0,
+                        extra: row.get("extra").unwrap_or_default(),
+                    })
+                    .collect())
+            })
+            .await?;
 
-                        let cid: i64 = row.get("cid").unwrap_or(0);
-                        let name: String = row.get("name").unwrap_or_default();
-                        let col_type: String = row.get("type").unwrap_or_default();
-                        let full_type: String = row.get("full_type").unwrap_or_default();
-                        let notnull: i64 = row.get("notnull").unwrap_or(0);
-                        let default: Option<String> = row.get("default");
-                        let pk: i64 = row.get("pk").unwrap_or(0);
-                        let extra: String = row.get("extra").unwrap_or_default();
+            let result = lua.create_table()?;
+            for (idx, col) in columns.into_iter().enumerate() {
+                let col_table = lua.create_table()?;
+                col_table.set("cid", col.cid)?;
+                col_table.set("name", col.name)?;
+                col_table.set("type", col.col_type)?;
+                col_table.set("full_type", col.full_type)?;
+                col_table.set("notnull", col.notnull)?;
+                col_table.set("default", col.default)?;
+                col_table.set("pk", col.pk)?;
+                col_table.set("extra", col.extra)?;
 
-                        col_table.set("cid", cid)?;
-                        col_table.set("name", name)?;
-                        col_table.set("type", col_type)?;
-                        col_table.set("full_type", full_type)?;
-                        col_table.set("notnull", notnull != 0)?;
-                        col_table.set("default", default)?;
-                        col_table.set("pk", pk != 0)?;
-                        col_table.set("extra", extra)?;
-
-                        result.set(idx + 1, col_table)?;
-                    }
-
-                    Ok(Value::Table(result))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
+                result.set(idx + 1, col_table)?;
             }
+
+            Ok(Value::Table(result))
         });
 
         // Get index list
-        methods.add_method("index_list", |lua, this, table_name: String| {
-            let mut conn = this.conn.borrow_mut();
+        methods.add_async_method("index_list", |lua, this, table_name: String| async move {
+            let conn = this.conn.clone();
+            drop(this);
 
-            let sql = r#"
-                SELECT DISTINCT
-                    INDEX_NAME as name,
-                    NOT NON_UNIQUE as `unique`
-                FROM information_schema.statistics
-                WHERE table_schema = DATABASE() AND table_name = ?
-            "#;
+            let indexes: Vec<(String, bool)> = run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
 
-            let rows: std::result::Result<Vec<MySqlRow>, mysql::Error> =
-                conn.exec(sql, (table_name,));
+                let sql = r#"
+                    SELECT DISTINCT
+                        INDEX_NAME as name,
+                        NOT NON_UNIQUE as `unique`
+                    FROM information_schema.statistics
+                    WHERE table_schema = DATABASE() AND table_name = ?
+                "#;
 
-            match rows {
-                Ok(rows) => {
-                    let result = lua.create_table()?;
+                let rows: Vec<MySqlRow> = conn
+                    .exec(sql, (table_name,))
+                    .map_err(mlua::Error::external)?;
 
-                    for (idx, row) in rows.iter().enumerate() {
-                        let index_table = lua.create_table()?;
-
+                Ok(rows
+                    .iter()
+                    .map(|row| {
                         let name: String = row.get("name").unwrap_or_default();
                         let unique: i64 = row.get("unique").unwrap_or(0);
+                        (name, unique != 0)
+                    })
+                    .collect())
+            })
+            .await?;
 
-                        index_table.set("name", name)?;
-                        index_table.set("unique", unique != 0)?;
+            let result = lua.create_table()?;
+            for (idx, (name, unique)) in indexes.into_iter().enumerate() {
+                let index_table = lua.create_table()?;
+                index_table.set("name", name)?;
+                index_table.set("unique", unique)?;
 
-                        result.set(idx + 1, index_table)?;
-                    }
-
-                    Ok(Value::Table(result))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
+                result.set(idx + 1, index_table)?;
             }
+
+            Ok(Value::Table(result))
         });
 
         // Ping to check connection
-        methods.add_method("ping", |_, this, ()| {
-            let mut conn = this.conn.borrow_mut();
-            match conn.query_drop("SELECT 1") {
-                Ok(_) => Ok(true),
-                Err(_) => Ok(false),
-            }
+        methods.add_async_method("ping", |_, this, ()| async move {
+            let conn = this.conn.clone();
+            drop(this);
+
+            run_blocking(move || {
+                let mut conn = lock_conn(&conn)?;
+                Ok(conn.query_drop("SELECT 1").is_ok())
+            })
+            .await
         });
 
         // Get server version
-        methods.add_method("server_version", |_, this, ()| {
-            let conn = this.conn.borrow();
-            Ok(conn.server_version())
+        //
+        // No network round-trip, but it needs the connection mutex: run it on
+        // the blocking pool so a long-running query on another coroutine never
+        // stalls the Lua event loop while we wait for the lock.
+        methods.add_async_method("server_version", |_, this, ()| async move {
+            let conn = this.conn.clone();
+            drop(this);
+
+            run_blocking(move || {
+                let conn = lock_conn(&conn)?;
+                Ok(conn.server_version())
+            })
+            .await
         });
     }
 }
@@ -463,7 +569,6 @@ enum MysqlValue {
     Integer(i64),
     Float(f64),
     Text(String),
-    Bytes(Vec<u8>),
 }
 
 impl MysqlValue {
@@ -473,7 +578,6 @@ impl MysqlValue {
             MysqlValue::Integer(i) => mysql::Value::Int(*i),
             MysqlValue::Float(f) => mysql::Value::Double(*f),
             MysqlValue::Text(s) => mysql::Value::Bytes(s.as_bytes().to_vec()),
-            MysqlValue::Bytes(b) => mysql::Value::Bytes(b.clone()),
         }
     }
 }
@@ -491,15 +595,32 @@ impl FromLua for MysqlValue {
     }
 }
 
+/// Connection target parsed from Lua arguments (Lua thread only).
+enum ConnectTarget {
+    Options(ConnectionOptions),
+    Url(String),
+}
+
+impl ConnectTarget {
+    fn open(self) -> std::result::Result<Database, MysqlError> {
+        match self {
+            ConnectTarget::Options(opts) => Database::open(opts),
+            ConnectTarget::Url(url) => Database::open_url(&url),
+        }
+    }
+}
+
 /// Register the mysql module with the Lua state
 pub fn register(lua: &Lua) -> Result<Table> {
     let module = lua.create_table()?;
 
-    // mysql.connect(options) - Connect with options table
+    // mysql.connect(options) - Connect with options table or URL string.
+    // Connecting is network I/O, so it runs on the blocking pool too.
     module.set(
         "connect",
-        lua.create_function(|lua, options: Value| {
-            let opts = match options {
+        lua.create_async_function(|_lua, options: Value| async move {
+            // Parse Lua arguments on the Lua thread, before spawn_blocking.
+            let target = match options {
                 Value::Table(t) => {
                     let host: String = t.get("host").unwrap_or_else(|_| "localhost".to_string());
                     let port: u16 = t.get("port").unwrap_or(3306);
@@ -507,22 +628,15 @@ pub fn register(lua: &Lua) -> Result<Table> {
                     let password: Option<String> = t.get("password").ok();
                     let database: Option<String> = t.get("database").ok();
 
-                    ConnectionOptions {
+                    ConnectTarget::Options(ConnectionOptions {
                         host,
                         port,
                         user,
                         password,
                         database,
-                    }
+                    })
                 }
-                Value::String(s) => {
-                    // URL format
-                    let url = s.to_str()?.to_string();
-                    return match Database::open_url(&url) {
-                        Ok(db) => Ok(db),
-                        Err(e) => Err(mlua::Error::external(e)),
-                    };
-                }
+                Value::String(s) => ConnectTarget::Url(s.to_str()?.to_string()),
                 _ => {
                     return Err(mlua::Error::external(
                         "connect() requires options table or URL string",
@@ -530,19 +644,15 @@ pub fn register(lua: &Lua) -> Result<Table> {
                 }
             };
 
-            match Database::open(opts) {
-                Ok(db) => Ok(db),
-                Err(e) => Err(mlua::Error::external(e)),
-            }
+            run_blocking(move || target.open().map_err(mlua::Error::external)).await
         })?,
     )?;
 
     // mysql.open(url) - Open with URL string (alias)
     module.set(
         "open",
-        lua.create_function(|_, url: String| match Database::open_url(&url) {
-            Ok(db) => Ok(db),
-            Err(e) => Err(mlua::Error::external(e)),
+        lua.create_async_function(|_, url: String| async move {
+            run_blocking(move || Database::open_url(&url).map_err(mlua::Error::external)).await
         })?,
     )?;
 

@@ -1,6 +1,10 @@
 //! HTTP client module for CopperMoon
 //!
 //! Provides HTTP client functionality for making web requests.
+//!
+//! All request functions are registered as async Lua functions: while a
+//! request is in flight the event loop keeps running (other HTTP handlers,
+//! timers, …). From Lua's perspective the API is still synchronous.
 
 use coppermoon_core::Result;
 use mlua::{Lua, Table};
@@ -12,11 +16,11 @@ use std::sync::{Arc, OnceLock};
 // Global connection-pooled HTTP client
 // ---------------------------------------------------------------------------
 
-static GLOBAL_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+static GLOBAL_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-fn global_client() -> &'static reqwest::blocking::Client {
+fn global_client() -> &'static reqwest::Client {
     GLOBAL_CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
+        reqwest::Client::builder()
             .pool_max_idle_per_host(10)
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
@@ -24,32 +28,120 @@ fn global_client() -> &'static reqwest::blocking::Client {
     })
 }
 
-/// Register the http module
+/// Register the http module.
+///
+/// Every request function is registered as a *hybrid* function (see
+/// [`crate::hybrid_fn`]): in yieldable contexts the request suspends the
+/// calling coroutine and the event loop keeps running; in non-yieldable
+/// contexts it blocks like before.
 pub fn register(lua: &Lua) -> Result<Table> {
     let http_table = lua.create_table()?;
 
     // http.get(url, options?) -> response
-    http_table.set("get", lua.create_function(http_get)?)?;
+    http_table.set("get", hybrid(lua, get_impl)?)?;
 
     // http.post(url, body, options?) -> response
-    http_table.set("post", lua.create_function(http_post)?)?;
+    http_table.set("post", hybrid(lua, post_impl)?)?;
 
     // http.put(url, body, options?) -> response
-    http_table.set("put", lua.create_function(http_put)?)?;
+    http_table.set("put", hybrid(lua, put_impl)?)?;
 
     // http.delete(url, options?) -> response
-    http_table.set("delete", lua.create_function(http_delete)?)?;
+    http_table.set("delete", hybrid(lua, delete_impl)?)?;
 
     // http.patch(url, body, options?) -> response
-    http_table.set("patch", lua.create_function(http_patch)?)?;
+    http_table.set("patch", hybrid(lua, patch_impl)?)?;
 
     // http.request(options) -> response
-    http_table.set("request", lua.create_function(http_request)?)?;
+    http_table.set("request", hybrid(lua, request_impl)?)?;
 
     // http.create_session() -> session (with cookie jar)
     http_table.set("create_session", lua.create_function(create_session)?)?;
 
     Ok(http_table)
+}
+
+/// Build a hybrid async/blocking Lua function from a single async
+/// implementation. The blocking path simply drives the same future to
+/// completion on the Tokio runtime.
+fn hybrid<A, FR>(
+    lua: &Lua,
+    imp: fn(Lua, A) -> FR,
+) -> mlua::Result<mlua::Function>
+where
+    A: mlua::FromLuaMulti + Send + 'static,
+    FR: std::future::Future<Output = mlua::Result<Table>> + Send + 'static,
+{
+    let async_fn = lua.create_async_function(move |lua, args: A| imp(lua, args))?;
+    let sync_fn = lua.create_function(move |lua, args: A| {
+        coppermoon_core::block_on(imp(lua.clone(), args))
+    })?;
+    crate::hybrid_fn(lua, async_fn, sync_fn)
+}
+
+async fn get_impl(lua: Lua, (url, options): (String, Option<Table>)) -> mlua::Result<Table> {
+    let opts = parse_options(options)?;
+    send_request(lua, reqwest::Method::GET, url, opts).await
+}
+
+async fn post_impl(lua: Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
+    let mut opts = parse_options(options)?;
+    if let Some(b) = body {
+        opts.body = Some(b);
+    }
+    send_request(lua, reqwest::Method::POST, url, opts).await
+}
+
+async fn put_impl(lua: Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
+    let mut opts = parse_options(options)?;
+    if let Some(b) = body {
+        opts.body = Some(b);
+    }
+    send_request(lua, reqwest::Method::PUT, url, opts).await
+}
+
+async fn delete_impl(lua: Lua, (url, options): (String, Option<Table>)) -> mlua::Result<Table> {
+    let opts = parse_options(options)?;
+    send_request(lua, reqwest::Method::DELETE, url, opts).await
+}
+
+async fn patch_impl(lua: Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
+    let mut opts = parse_options(options)?;
+    if let Some(b) = body {
+        opts.body = Some(b);
+    }
+    send_request(lua, reqwest::Method::PATCH, url, opts).await
+}
+
+async fn request_impl(lua: Lua, options: Table) -> mlua::Result<Table> {
+    let method_str: String = options.get("method")
+        .unwrap_or_else(|_| "GET".to_string());
+    let url: String = options.get("url")
+        .map_err(|_| mlua::Error::runtime("Missing 'url' in request options"))?;
+
+    let method = parse_method(&method_str)?;
+    let opts = RequestOptions::from_table(&options)?;
+    send_request(lua, method, url, opts).await
+}
+
+fn parse_method(method_str: &str) -> mlua::Result<reqwest::Method> {
+    match method_str.to_uppercase().as_str() {
+        "GET" => Ok(reqwest::Method::GET),
+        "POST" => Ok(reqwest::Method::POST),
+        "PUT" => Ok(reqwest::Method::PUT),
+        "DELETE" => Ok(reqwest::Method::DELETE),
+        "PATCH" => Ok(reqwest::Method::PATCH),
+        "HEAD" => Ok(reqwest::Method::HEAD),
+        "OPTIONS" => Ok(reqwest::Method::OPTIONS),
+        _ => Err(mlua::Error::runtime(format!("Unsupported HTTP method: {}", method_str))),
+    }
+}
+
+fn parse_options(options: Option<Table>) -> mlua::Result<RequestOptions> {
+    options
+        .map(|t| RequestOptions::from_table(&t))
+        .transpose()
+        .map(|o| o.unwrap_or_else(RequestOptions::empty))
 }
 
 /// Options for HTTP requests
@@ -104,7 +196,7 @@ impl RequestOptions {
     }
 }
 
-fn build_response(lua: &Lua, response: reqwest::blocking::Response) -> mlua::Result<Table> {
+async fn build_response(lua: &Lua, response: reqwest::Response) -> mlua::Result<Table> {
     let status = response.status().as_u16();
     let status_text = response.status().canonical_reason().unwrap_or("").to_string();
     let url = response.url().to_string();
@@ -124,7 +216,7 @@ fn build_response(lua: &Lua, response: reqwest::blocking::Response) -> mlua::Res
         }
     }
 
-    let body = response.text()
+    let body = response.text().await
         .map_err(|e| mlua::Error::runtime(format!("Failed to read response body: {}", e)))?;
 
     let result = lua.create_table()?;
@@ -158,11 +250,11 @@ fn build_response(lua: &Lua, response: reqwest::blocking::Response) -> mlua::Res
 }
 
 fn build_request(
-    client: &reqwest::blocking::Client,
+    client: &reqwest::Client,
     method: reqwest::Method,
     url: &str,
     opts: &RequestOptions,
-) -> reqwest::blocking::RequestBuilder {
+) -> reqwest::RequestBuilder {
     let mut request = client.request(method, url);
 
     if let Some(timeout) = opts.timeout {
@@ -182,7 +274,7 @@ fn build_request(
     request
 }
 
-fn apply_cookies(request: reqwest::blocking::RequestBuilder, cookies: &HashMap<String, String>) -> reqwest::blocking::RequestBuilder {
+fn apply_cookies(request: reqwest::RequestBuilder, cookies: &HashMap<String, String>) -> reqwest::RequestBuilder {
     if cookies.is_empty() {
         return request;
     }
@@ -196,96 +288,18 @@ fn apply_cookies(request: reqwest::blocking::RequestBuilder, cookies: &HashMap<S
     request.header("Cookie", cookie_header)
 }
 
-fn send_request(
-    lua: &Lua,
+async fn send_request(
+    lua: Lua,
     method: reqwest::Method,
-    url: &str,
+    url: String,
     opts: RequestOptions,
 ) -> mlua::Result<Table> {
-    let client = global_client();
-    let request = build_request(client, method, url, &opts);
+    let request = build_request(global_client(), method, &url, &opts);
 
-    let response = coppermoon_core::block_on(async {
-        tokio::task::spawn_blocking(move || request.send())
-            .await
-            .map_err(|e| mlua::Error::runtime(format!("Task join error: {}", e)))?
-            .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))
-    })?;
+    let response = request.send().await
+        .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))?;
 
-    build_response(lua, response)
-}
-
-fn http_get(lua: &Lua, (url, options): (String, Option<Table>)) -> mlua::Result<Table> {
-    let opts = options.map(|t| RequestOptions::from_table(&t))
-        .transpose()?
-        .unwrap_or_else(RequestOptions::empty);
-
-    send_request(lua, reqwest::Method::GET, &url, opts)
-}
-
-fn http_post(lua: &Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
-    let mut opts = options.map(|t| RequestOptions::from_table(&t))
-        .transpose()?
-        .unwrap_or_else(RequestOptions::empty);
-
-    if let Some(b) = body {
-        opts.body = Some(b);
-    }
-
-    send_request(lua, reqwest::Method::POST, &url, opts)
-}
-
-fn http_put(lua: &Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
-    let mut opts = options.map(|t| RequestOptions::from_table(&t))
-        .transpose()?
-        .unwrap_or_else(RequestOptions::empty);
-
-    if let Some(b) = body {
-        opts.body = Some(b);
-    }
-
-    send_request(lua, reqwest::Method::PUT, &url, opts)
-}
-
-fn http_delete(lua: &Lua, (url, options): (String, Option<Table>)) -> mlua::Result<Table> {
-    let opts = options.map(|t| RequestOptions::from_table(&t))
-        .transpose()?
-        .unwrap_or_else(RequestOptions::empty);
-
-    send_request(lua, reqwest::Method::DELETE, &url, opts)
-}
-
-fn http_patch(lua: &Lua, (url, body, options): (String, Option<String>, Option<Table>)) -> mlua::Result<Table> {
-    let mut opts = options.map(|t| RequestOptions::from_table(&t))
-        .transpose()?
-        .unwrap_or_else(RequestOptions::empty);
-
-    if let Some(b) = body {
-        opts.body = Some(b);
-    }
-
-    send_request(lua, reqwest::Method::PATCH, &url, opts)
-}
-
-fn http_request(lua: &Lua, options: Table) -> mlua::Result<Table> {
-    let method_str: String = options.get("method")
-        .unwrap_or_else(|_| "GET".to_string());
-    let url: String = options.get("url")
-        .map_err(|_| mlua::Error::runtime("Missing 'url' in request options"))?;
-
-    let method = match method_str.to_uppercase().as_str() {
-        "GET" => reqwest::Method::GET,
-        "POST" => reqwest::Method::POST,
-        "PUT" => reqwest::Method::PUT,
-        "DELETE" => reqwest::Method::DELETE,
-        "PATCH" => reqwest::Method::PATCH,
-        "HEAD" => reqwest::Method::HEAD,
-        "OPTIONS" => reqwest::Method::OPTIONS,
-        _ => return Err(mlua::Error::runtime(format!("Unsupported HTTP method: {}", method_str))),
-    };
-
-    let opts = RequestOptions::from_table(&options)?;
-    send_request(lua, method, &url, opts)
+    build_response(&lua, response).await
 }
 
 // HTTP Session with persistent cookies
@@ -293,26 +307,26 @@ use mlua::{UserData, UserDataMethods};
 use std::sync::Mutex;
 
 struct HttpSession {
-    client: Arc<reqwest::blocking::Client>,
+    client: reqwest::Client,
     cookies: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl UserData for HttpSession {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("get", |lua, this, (url, options): (String, Option<Table>)| {
-            session_request(lua, this, "GET", url, None, options)
+        methods.add_async_method("get", |lua, this, (url, options): (String, Option<Table>)| async move {
+            session_request(lua, &this, "GET", url, None, options).await
         });
 
-        methods.add_method("post", |lua, this, (url, body, options): (String, Option<String>, Option<Table>)| {
-            session_request(lua, this, "POST", url, body, options)
+        methods.add_async_method("post", |lua, this, (url, body, options): (String, Option<String>, Option<Table>)| async move {
+            session_request(lua, &this, "POST", url, body, options).await
         });
 
-        methods.add_method("put", |lua, this, (url, body, options): (String, Option<String>, Option<Table>)| {
-            session_request(lua, this, "PUT", url, body, options)
+        methods.add_async_method("put", |lua, this, (url, body, options): (String, Option<String>, Option<Table>)| async move {
+            session_request(lua, &this, "PUT", url, body, options).await
         });
 
-        methods.add_method("delete", |lua, this, (url, options): (String, Option<Table>)| {
-            session_request(lua, this, "DELETE", url, None, options)
+        methods.add_async_method("delete", |lua, this, (url, options): (String, Option<Table>)| async move {
+            session_request(lua, &this, "DELETE", url, None, options).await
         });
 
         methods.add_method("set_cookie", |_, this, (name, value): (String, String)| {
@@ -347,19 +361,17 @@ impl UserData for HttpSession {
     }
 }
 
-fn session_request(
-    lua: &Lua,
+async fn session_request(
+    lua: Lua,
     session: &HttpSession,
     method: &str,
     url: String,
     body: Option<String>,
     options: Option<Table>,
 ) -> mlua::Result<Table> {
-    let mut opts = options.map(|t| RequestOptions::from_table(&t))
-        .transpose()?
-        .unwrap_or_else(RequestOptions::empty);
+    let mut opts = parse_options(options)?;
 
-    // Merge session cookies into opts
+    // Merge session cookies into opts (guard dropped before any await)
     let session_cookies = session.cookies.lock()
         .map_err(|e| mlua::Error::runtime(format!("Lock error: {}", e)))?
         .clone();
@@ -371,24 +383,11 @@ fn session_request(
         opts.body = Some(b);
     }
 
-    let req_method = match method {
-        "GET" => reqwest::Method::GET,
-        "POST" => reqwest::Method::POST,
-        "PUT" => reqwest::Method::PUT,
-        "DELETE" => reqwest::Method::DELETE,
-        "PATCH" => reqwest::Method::PATCH,
-        _ => return Err(mlua::Error::runtime(format!("Unsupported method: {}", method))),
-    };
+    let req_method = parse_method(method)?;
+    let request = build_request(&session.client, req_method, &url, &opts);
 
-    let client = &*session.client;
-    let request = build_request(client, req_method, &url, &opts);
-
-    let response = coppermoon_core::block_on(async {
-        tokio::task::spawn_blocking(move || request.send())
-            .await
-            .map_err(|e| mlua::Error::runtime(format!("Task join error: {}", e)))?
-            .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))
-    })?;
+    let response = request.send().await
+        .map_err(|e| mlua::Error::runtime(format!("HTTP request failed: {}", e)))?;
 
     // Extract Set-Cookie headers and update session
     for (key, value) in response.headers() {
@@ -405,17 +404,17 @@ fn session_request(
         }
     }
 
-    build_response(lua, response)
+    build_response(&lua, response).await
 }
 
 fn create_session(_: &Lua, _: ()) -> mlua::Result<HttpSession> {
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .cookie_store(true)
         .build()
         .map_err(|e| mlua::Error::runtime(format!("Failed to create client: {}", e)))?;
 
     Ok(HttpSession {
-        client: Arc::new(client),
+        client,
         cookies: Arc::new(Mutex::new(HashMap::new())),
     })
 }

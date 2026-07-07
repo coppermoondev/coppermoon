@@ -32,6 +32,10 @@ COPY installer/ /installer/
 # App directory
 WORKDIR /app
 
+# Inside a container the HTTP server must bind all interfaces, not loopback.
+# Apps can still override this per-listen: server:listen(port, host).
+ENV COPPERMOON_HOST=0.0.0.0
+
 EXPOSE 3000
 
 CMD ["coppermoon"]

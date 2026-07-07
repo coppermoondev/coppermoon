@@ -2,11 +2,18 @@
 //!
 //! Provides PostgreSQL database bindings for CopperMoon Lua runtime.
 //! This module provides a compatible interface with the MySQL and SQLite modules.
+//!
+//! All network-facing operations are registered as async Lua functions: the
+//! actual database calls run on `tokio::task::spawn_blocking` threads (the
+//! sync `postgres` crate drives its own internal runtime and must never run
+//! on the event-loop thread), while the calling coroutine is suspended so the
+//! event loop keeps running. From Lua's perspective the API is unchanged.
 
 use mlua::{FromLua, Lua, MultiValue, Result, Table, UserData, UserDataMethods, Value};
 use postgres::types::Type;
 use postgres::NoTls;
-use std::cell::RefCell;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// PostgreSQL error types
 #[derive(Debug, thiserror::Error)]
@@ -20,10 +27,14 @@ pub enum PostgresError {
 }
 
 /// PostgreSQL Database connection wrapper
+///
+/// The client lives behind an `Arc<Mutex<..>>` so it can be moved onto
+/// `spawn_blocking` threads. The mutex is only ever locked *inside* those
+/// blocking threads, never on the event-loop thread.
 pub struct Database {
-    client: RefCell<postgres::Client>,
-    last_insert_id: RefCell<i64>,
-    affected_rows: RefCell<u64>,
+    client: Arc<Mutex<postgres::Client>>,
+    last_insert_id: Arc<AtomicI64>,
+    affected_rows: Arc<AtomicU64>,
 }
 
 /// Connection options for PostgreSQL
@@ -49,7 +60,18 @@ impl Default for ConnectionOptions {
 }
 
 impl Database {
+    fn from_client(client: postgres::Client) -> Self {
+        Self {
+            client: Arc::new(Mutex::new(client)),
+            last_insert_id: Arc::new(AtomicI64::new(0)),
+            affected_rows: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     /// Open a database connection with options
+    ///
+    /// NOTE: this performs blocking network I/O — call it from a
+    /// `spawn_blocking` thread, never from the event loop.
     pub fn open(options: ConnectionOptions) -> std::result::Result<Self, PostgresError> {
         let mut params = format!(
             "host={} port={} user={}",
@@ -66,23 +88,41 @@ impl Database {
 
         let client = postgres::Client::connect(&params, NoTls)?;
 
-        Ok(Self {
-            client: RefCell::new(client),
-            last_insert_id: RefCell::new(0),
-            affected_rows: RefCell::new(0),
-        })
+        Ok(Self::from_client(client))
     }
 
     /// Open a database connection with URL
+    ///
+    /// NOTE: this performs blocking network I/O — call it from a
+    /// `spawn_blocking` thread, never from the event loop.
     pub fn open_url(url: &str) -> std::result::Result<Self, PostgresError> {
         let client = postgres::Client::connect(url, NoTls)?;
 
-        Ok(Self {
-            client: RefCell::new(client),
-            last_insert_id: RefCell::new(0),
-            affected_rows: RefCell::new(0),
-        })
+        Ok(Self::from_client(client))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Blocking-thread helper
+// ---------------------------------------------------------------------------
+
+/// Run a closure against the client on a `spawn_blocking` thread.
+///
+/// The closure receives the locked client and must only produce pure Rust
+/// data (`T: Send`) — Lua values are built by the caller *after* the await.
+async fn with_client<T, F>(client: Arc<Mutex<postgres::Client>>, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut postgres::Client) -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut client = client
+            .lock()
+            .map_err(|_| mlua::Error::runtime("PostgreSQL connection lock poisoned"))?;
+        f(&mut client)
+    })
+    .await
+    .map_err(mlua::Error::external)?
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +179,23 @@ impl FromLua for PgValue {
             _ => Err(mlua::Error::external("Unsupported value type for PostgreSQL")),
         }
     }
+}
+
+/// Parse `(sql, param...)` from a Lua MultiValue. Runs on the Lua thread,
+/// *before* any spawn_blocking.
+fn parse_sql_args(lua: &Lua, args: MultiValue) -> Result<(String, Vec<PgValue>)> {
+    let mut args_iter = args.into_iter();
+
+    let sql: String = match args_iter.next() {
+        Some(Value::String(s)) => s.to_str()?.to_string(),
+        _ => return Err(mlua::Error::external("First argument must be SQL string")),
+    };
+
+    let params: Vec<PgValue> = args_iter
+        .map(|v| PgValue::from_lua(v, lua))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((sql, params))
 }
 
 /// Build a vector of boxed ToSql trait objects from PgValue list.
@@ -228,183 +285,214 @@ fn pg_column_to_lua(row: &postgres::Row, idx: usize, pg_type: &Type, lua: &Lua) 
 impl UserData for Database {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         // Execute a SQL statement without parameters
-        methods.add_method("exec", |_lua, this, sql: String| {
-            let mut client = this.client.borrow_mut();
-            match client.execute(sql.as_str(), &[]) {
-                Ok(affected) => {
-                    *this.affected_rows.borrow_mut() = affected;
-                    Ok(Value::Integer(affected as i64))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
-            }
+        methods.add_async_method("exec", |_lua, this, sql: String| async move {
+            let client = this.client.clone();
+            let affected_rows = this.affected_rows.clone();
+            // Userdata borrows are exclusive: release `this` before any
+            // await so other coroutines can borrow this object.
+            drop(this);
+
+            let affected =
+                with_client(client, move |client| {
+                    client
+                        .execute(sql.as_str(), &[])
+                        .map_err(mlua::Error::external)
+                })
+                .await?;
+
+            affected_rows.store(affected, Ordering::SeqCst);
+            Ok(Value::Integer(affected as i64))
         });
 
         // Execute a SQL statement with parameters (? placeholders)
-        methods.add_method("execute", |lua, this, args: MultiValue| {
-            let mut args_iter = args.into_iter();
-
-            let sql: String = match args_iter.next() {
-                Some(Value::String(s)) => s.to_str()?.to_string(),
-                _ => return Err(mlua::Error::external("First argument must be SQL string")),
-            };
-
-            let params: Vec<PgValue> = args_iter
-                .map(|v| PgValue::from_lua(v, lua))
-                .collect::<Result<Vec<_>>>()?;
+        methods.add_async_method("execute", |lua, this, args: MultiValue| async move {
+            // Parse Lua arguments on the Lua thread, before spawn_blocking.
+            let (sql, params) = parse_sql_args(&lua, args)?;
 
             let converted_sql = convert_placeholders(&sql);
-            let boxed_params = build_params(&params);
-            let param_refs = params_as_refs(&boxed_params);
-
-            let mut client = this.client.borrow_mut();
 
             // Check if this is an INSERT to capture last_insert_id
             let is_insert = sql.trim_start().to_uppercase().starts_with("INSERT");
 
-            match client.execute(converted_sql.as_str(), &param_refs) {
-                Ok(affected) => {
-                    *this.affected_rows.borrow_mut() = affected;
+            let client = this.client.clone();
+            let affected_rows = this.affected_rows.clone();
+            let last_insert_id = this.last_insert_id.clone();
+            drop(this);
 
-                    // Try to get last inserted ID via lastval()
-                    if is_insert {
-                        if let Ok(row) = client.query_one("SELECT lastval()", &[]) {
-                            if let Ok(id) = row.try_get::<_, i64>(0) {
-                                *this.last_insert_id.borrow_mut() = id;
-                            }
+            let (affected, last_id) = with_client(client, move |client| {
+                let boxed_params = build_params(&params);
+                let param_refs = params_as_refs(&boxed_params);
+
+                let affected = client
+                    .execute(converted_sql.as_str(), &param_refs)
+                    .map_err(mlua::Error::external)?;
+
+                // Try to get last inserted ID via lastval()
+                let mut last_id = None;
+                if is_insert {
+                    if let Ok(row) = client.query_one("SELECT lastval()", &[]) {
+                        if let Ok(id) = row.try_get::<_, i64>(0) {
+                            last_id = Some(id);
                         }
                     }
-
-                    Ok(Value::Integer(affected as i64))
                 }
-                Err(e) => Err(mlua::Error::external(e)),
+
+                Ok((affected, last_id))
+            })
+            .await?;
+
+            affected_rows.store(affected, Ordering::SeqCst);
+            if let Some(id) = last_id {
+                last_insert_id.store(id, Ordering::SeqCst);
             }
+
+            Ok(Value::Integer(affected as i64))
         });
 
         // Query and return all rows
-        methods.add_method("query", |lua, this, args: MultiValue| {
-            let mut args_iter = args.into_iter();
-
-            let sql: String = match args_iter.next() {
-                Some(Value::String(s)) => s.to_str()?.to_string(),
-                _ => return Err(mlua::Error::external("First argument must be SQL string")),
-            };
-
-            let params: Vec<PgValue> = args_iter
-                .map(|v| PgValue::from_lua(v, lua))
-                .collect::<Result<Vec<_>>>()?;
-
+        methods.add_async_method("query", |lua, this, args: MultiValue| async move {
+            let (sql, params) = parse_sql_args(&lua, args)?;
             let converted_sql = convert_placeholders(&sql);
-            let boxed_params = build_params(&params);
-            let param_refs = params_as_refs(&boxed_params);
 
-            let mut client = this.client.borrow_mut();
+            let client = this.client.clone();
+            drop(this);
 
-            match client.query(converted_sql.as_str(), &param_refs) {
-                Ok(rows) => {
-                    let result = lua.create_table()?;
+            // Fetch raw rows on the blocking thread; postgres::Row is Send,
+            // so Lua tables are built after the await, on the Lua thread.
+            let rows = with_client(client, move |client| {
+                let boxed_params = build_params(&params);
+                let param_refs = params_as_refs(&boxed_params);
 
-                    for (idx, row) in rows.iter().enumerate() {
-                        let row_table = pg_row_to_lua_table(row, lua)?;
-                        result.set(idx + 1, row_table)?;
-                    }
+                client
+                    .query(converted_sql.as_str(), &param_refs)
+                    .map_err(mlua::Error::external)
+            })
+            .await?;
 
-                    Ok(Value::Table(result))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
+            let result = lua.create_table()?;
+
+            for (idx, row) in rows.iter().enumerate() {
+                let row_table = pg_row_to_lua_table(row, &lua)?;
+                result.set(idx + 1, row_table)?;
             }
+
+            Ok(Value::Table(result))
         });
 
         // Query and return first row only
-        methods.add_method("query_row", |lua, this, args: MultiValue| {
-            let mut args_iter = args.into_iter();
-
-            let sql: String = match args_iter.next() {
-                Some(Value::String(s)) => s.to_str()?.to_string(),
-                _ => return Err(mlua::Error::external("First argument must be SQL string")),
-            };
-
-            let params: Vec<PgValue> = args_iter
-                .map(|v| PgValue::from_lua(v, lua))
-                .collect::<Result<Vec<_>>>()?;
-
+        methods.add_async_method("query_row", |lua, this, args: MultiValue| async move {
+            let (sql, params) = parse_sql_args(&lua, args)?;
             let converted_sql = convert_placeholders(&sql);
-            let boxed_params = build_params(&params);
-            let param_refs = params_as_refs(&boxed_params);
 
-            let mut client = this.client.borrow_mut();
+            let client = this.client.clone();
+            drop(this);
 
-            match client.query_opt(converted_sql.as_str(), &param_refs) {
-                Ok(Some(row)) => {
-                    let row_table = pg_row_to_lua_table(&row, lua)?;
+            let row = with_client(client, move |client| {
+                let boxed_params = build_params(&params);
+                let param_refs = params_as_refs(&boxed_params);
+
+                client
+                    .query_opt(converted_sql.as_str(), &param_refs)
+                    .map_err(mlua::Error::external)
+            })
+            .await?;
+
+            match row {
+                Some(row) => {
+                    let row_table = pg_row_to_lua_table(&row, &lua)?;
                     Ok(Value::Table(row_table))
                 }
-                Ok(None) => Ok(Value::Nil),
-                Err(e) => Err(mlua::Error::external(e)),
+                None => Ok(Value::Nil),
             }
         });
 
         // Get last insert id (via lastval())
         methods.add_method("last_insert_id", |_, this, ()| {
-            Ok(*this.last_insert_id.borrow())
+            Ok(this.last_insert_id.load(Ordering::SeqCst))
         });
 
         // Alias for compatibility with SQLite module
         methods.add_method("last_insert_rowid", |_, this, ()| {
-            Ok(*this.last_insert_id.borrow())
+            Ok(this.last_insert_id.load(Ordering::SeqCst))
         });
 
         // Get changes count from last statement
         methods.add_method("changes", |_, this, ()| {
-            Ok(*this.affected_rows.borrow() as i64)
+            Ok(this.affected_rows.load(Ordering::SeqCst) as i64)
         });
 
         // Begin transaction
-        methods.add_method("begin", |_, this, ()| {
-            let mut client = this.client.borrow_mut();
-            client
-                .execute("BEGIN", &[])
-                .map_err(mlua::Error::external)?;
+        methods.add_async_method("begin", |_, this, ()| async move {
+            let client = this.client.clone();
+            drop(this);
+            with_client(client, |client| {
+                client
+                    .execute("BEGIN", &[])
+                    .map_err(mlua::Error::external)
+            })
+            .await?;
             Ok(())
         });
 
         // Commit transaction
-        methods.add_method("commit", |_, this, ()| {
-            let mut client = this.client.borrow_mut();
-            client
-                .execute("COMMIT", &[])
-                .map_err(mlua::Error::external)?;
+        methods.add_async_method("commit", |_, this, ()| async move {
+            let client = this.client.clone();
+            drop(this);
+            with_client(client, |client| {
+                client
+                    .execute("COMMIT", &[])
+                    .map_err(mlua::Error::external)
+            })
+            .await?;
             Ok(())
         });
 
         // Rollback transaction
-        methods.add_method("rollback", |_, this, ()| {
-            let mut client = this.client.borrow_mut();
-            client
-                .execute("ROLLBACK", &[])
-                .map_err(mlua::Error::external)?;
+        methods.add_async_method("rollback", |_, this, ()| async move {
+            let client = this.client.clone();
+            drop(this);
+            with_client(client, |client| {
+                client
+                    .execute("ROLLBACK", &[])
+                    .map_err(mlua::Error::external)
+            })
+            .await?;
             Ok(())
         });
 
         // Transaction helper
-        methods.add_method("transaction", |_lua, this, func: mlua::Function| {
-            {
-                let mut client = this.client.borrow_mut();
+        methods.add_async_method("transaction", |_lua, this, func: mlua::Function| async move {
+            let client = this.client.clone();
+            // Release the exclusive userdata borrow before any await: the
+            // Lua callback below may re-enter methods of this same object.
+            drop(this);
+
+            with_client(client.clone(), |client| {
                 client
                     .execute("BEGIN", &[])
-                    .map_err(mlua::Error::external)?;
-            }
+                    .map_err(mlua::Error::external)
+            })
+            .await?;
 
-            match func.call::<()>(()) {
+            // The Lua callback runs on the Lua thread (call_async suspends
+            // the coroutine as needed) — never inside spawn_blocking.
+            match func.call_async::<()>(()).await {
                 Ok(_) => {
-                    let mut client = this.client.borrow_mut();
-                    client
-                        .execute("COMMIT", &[])
-                        .map_err(mlua::Error::external)?;
+                    with_client(client, |client| {
+                        client
+                            .execute("COMMIT", &[])
+                            .map_err(mlua::Error::external)
+                    })
+                    .await?;
                     Ok(true)
                 }
                 Err(e) => {
-                    let mut client = this.client.borrow_mut();
-                    let _ = client.execute("ROLLBACK", &[]);
+                    let _ = with_client(client, |client| {
+                        client
+                            .execute("ROLLBACK", &[])
+                            .map_err(mlua::Error::external)
+                    })
+                    .await;
                     Err(e)
                 }
             }
@@ -417,23 +505,28 @@ impl UserData for Database {
         });
 
         // Check if table exists
-        methods.add_method("table_exists", |_, this, table_name: String| {
-            let mut client = this.client.borrow_mut();
+        methods.add_async_method("table_exists", |_, this, table_name: String| async move {
+            let client = this.client.clone();
+            drop(this);
 
             let sql = "SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_catalog = current_database() AND table_schema = 'public' AND table_name = $1";
 
-            match client.query_one(sql, &[&table_name]) {
-                Ok(row) => {
-                    let count: i64 = row.get("cnt");
-                    Ok(count > 0)
-                }
-                Err(e) => Err(mlua::Error::external(e)),
-            }
+            let count = with_client(client, move |client| {
+                let row = client
+                    .query_one(sql, &[&table_name])
+                    .map_err(mlua::Error::external)?;
+                let count: i64 = row.get("cnt");
+                Ok(count)
+            })
+            .await?;
+
+            Ok(count > 0)
         });
 
         // Get table info (columns)
-        methods.add_method("table_info", |lua, this, table_name: String| {
-            let mut client = this.client.borrow_mut();
+        methods.add_async_method("table_info", |lua, this, table_name: String| async move {
+            let client = this.client.clone();
+            drop(this);
 
             let sql = r#"
                 SELECT
@@ -465,43 +558,59 @@ impl UserData for Database {
                 ORDER BY c.ordinal_position
             "#;
 
-            match client.query(sql, &[&table_name]) {
-                Ok(rows) => {
-                    let result = lua.create_table()?;
+            // Extract pure Rust data on the blocking thread…
+            let columns = with_client(client, move |client| {
+                let rows = client
+                    .query(sql, &[&table_name])
+                    .map_err(mlua::Error::external)?;
 
-                    for (idx, row) in rows.iter().enumerate() {
-                        let col_table = lua.create_table()?;
+                let columns: Vec<(i32, String, String, String, bool, Option<String>, bool, String)> = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get("cid"),
+                            row.get("name"),
+                            row.get("type"),
+                            row.get("full_type"),
+                            row.get("notnull"),
+                            row.get("default"),
+                            row.get("pk"),
+                            row.get("extra"),
+                        )
+                    })
+                    .collect();
 
-                        let cid: i32 = row.get("cid");
-                        let name: String = row.get("name");
-                        let col_type: String = row.get("type");
-                        let full_type: String = row.get("full_type");
-                        let notnull: bool = row.get("notnull");
-                        let default: Option<String> = row.get("default");
-                        let pk: bool = row.get("pk");
-                        let extra: String = row.get("extra");
+                Ok(columns)
+            })
+            .await?;
 
-                        col_table.set("cid", cid as i64)?;
-                        col_table.set("name", name)?;
-                        col_table.set("type", col_type)?;
-                        col_table.set("full_type", full_type)?;
-                        col_table.set("notnull", notnull)?;
-                        col_table.set("default", default)?;
-                        col_table.set("pk", pk)?;
-                        col_table.set("extra", extra)?;
+            // …then build Lua tables on the Lua thread.
+            let result = lua.create_table()?;
 
-                        result.set(idx + 1, col_table)?;
-                    }
+            for (idx, (cid, name, col_type, full_type, notnull, default, pk, extra)) in
+                columns.into_iter().enumerate()
+            {
+                let col_table = lua.create_table()?;
 
-                    Ok(Value::Table(result))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
+                col_table.set("cid", cid as i64)?;
+                col_table.set("name", name)?;
+                col_table.set("type", col_type)?;
+                col_table.set("full_type", full_type)?;
+                col_table.set("notnull", notnull)?;
+                col_table.set("default", default)?;
+                col_table.set("pk", pk)?;
+                col_table.set("extra", extra)?;
+
+                result.set(idx + 1, col_table)?;
             }
+
+            Ok(Value::Table(result))
         });
 
         // Get index list
-        methods.add_method("index_list", |lua, this, table_name: String| {
-            let mut client = this.client.borrow_mut();
+        methods.add_async_method("index_list", |lua, this, table_name: String| async move {
+            let client = this.client.clone();
+            drop(this);
 
             let sql = r#"
                 SELECT
@@ -511,47 +620,58 @@ impl UserData for Database {
                 WHERE schemaname = 'public' AND tablename = $1
             "#;
 
-            match client.query(sql, &[&table_name]) {
-                Ok(rows) => {
-                    let result = lua.create_table()?;
+            let indexes = with_client(client, move |client| {
+                let rows = client
+                    .query(sql, &[&table_name])
+                    .map_err(mlua::Error::external)?;
 
-                    for (idx, row) in rows.iter().enumerate() {
-                        let index_table = lua.create_table()?;
+                let indexes: Vec<(String, bool)> = rows
+                    .iter()
+                    .map(|row| (row.get("name"), row.get("unique")))
+                    .collect();
 
-                        let name: String = row.get("name");
-                        let unique: bool = row.get("unique");
+                Ok(indexes)
+            })
+            .await?;
 
-                        index_table.set("name", name)?;
-                        index_table.set("unique", unique)?;
+            let result = lua.create_table()?;
 
-                        result.set(idx + 1, index_table)?;
-                    }
+            for (idx, (name, unique)) in indexes.into_iter().enumerate() {
+                let index_table = lua.create_table()?;
 
-                    Ok(Value::Table(result))
-                }
-                Err(e) => Err(mlua::Error::external(e)),
+                index_table.set("name", name)?;
+                index_table.set("unique", unique)?;
+
+                result.set(idx + 1, index_table)?;
             }
+
+            Ok(Value::Table(result))
         });
 
         // Ping to check connection
-        methods.add_method("ping", |_, this, ()| {
-            let mut client = this.client.borrow_mut();
-            match client.simple_query("SELECT 1") {
-                Ok(_) => Ok(true),
-                Err(_) => Ok(false),
-            }
+        methods.add_async_method("ping", |_, this, ()| async move {
+            let client = this.client.clone();
+            drop(this);
+            with_client(client, |client| {
+                Ok(client.simple_query("SELECT 1").is_ok())
+            })
+            .await
         });
 
         // Get server version
-        methods.add_method("server_version", |_, this, ()| {
-            let mut client = this.client.borrow_mut();
-            match client.query_one("SHOW server_version", &[]) {
-                Ok(row) => {
-                    let version: String = row.get(0);
-                    Ok(version)
+        methods.add_async_method("server_version", |_, this, ()| async move {
+            let client = this.client.clone();
+            drop(this);
+            with_client(client, |client| {
+                match client.query_one("SHOW server_version", &[]) {
+                    Ok(row) => {
+                        let version: String = row.get(0);
+                        Ok(version)
+                    }
+                    Err(e) => Err(mlua::Error::external(e)),
                 }
-                Err(e) => Err(mlua::Error::external(e)),
-            }
+            })
+            .await
         });
     }
 }
@@ -560,6 +680,26 @@ impl UserData for Database {
 // Module registration
 // ---------------------------------------------------------------------------
 
+/// What `connect()` should do, resolved on the Lua thread before any
+/// blocking work.
+enum ConnectTarget {
+    Options(ConnectionOptions),
+    Url(String),
+}
+
+/// Open a connection on a blocking thread.
+async fn connect_blocking(target: ConnectTarget) -> Result<Database> {
+    tokio::task::spawn_blocking(move || {
+        let db = match target {
+            ConnectTarget::Options(opts) => Database::open(opts),
+            ConnectTarget::Url(url) => Database::open_url(&url),
+        };
+        db.map_err(mlua::Error::external)
+    })
+    .await
+    .map_err(mlua::Error::external)?
+}
+
 /// Register the postgresql module with the Lua state
 pub fn register(lua: &Lua) -> Result<Table> {
     let module = lua.create_table()?;
@@ -567,8 +707,9 @@ pub fn register(lua: &Lua) -> Result<Table> {
     // postgresql.connect(options) - Connect with options table or URL string
     module.set(
         "connect",
-        lua.create_function(|_lua, options: Value| {
-            let opts = match options {
+        lua.create_async_function(|_lua, options: Value| async move {
+            // Parse Lua arguments on the Lua thread, before spawn_blocking.
+            let target = match options {
                 Value::Table(t) => {
                     let host: String =
                         t.get("host").unwrap_or_else(|_| "localhost".to_string());
@@ -579,21 +720,15 @@ pub fn register(lua: &Lua) -> Result<Table> {
                     let database: Option<String> =
                         t.get("database").or_else(|_| t.get("dbname")).ok();
 
-                    ConnectionOptions {
+                    ConnectTarget::Options(ConnectionOptions {
                         host,
                         port,
                         user,
                         password,
                         database,
-                    }
+                    })
                 }
-                Value::String(s) => {
-                    let url = s.to_str()?.to_string();
-                    return match Database::open_url(&url) {
-                        Ok(db) => Ok(db),
-                        Err(e) => Err(mlua::Error::external(e)),
-                    };
-                }
+                Value::String(s) => ConnectTarget::Url(s.to_str()?.to_string()),
                 _ => {
                     return Err(mlua::Error::external(
                         "connect() requires options table or URL string",
@@ -601,19 +736,15 @@ pub fn register(lua: &Lua) -> Result<Table> {
                 }
             };
 
-            match Database::open(opts) {
-                Ok(db) => Ok(db),
-                Err(e) => Err(mlua::Error::external(e)),
-            }
+            connect_blocking(target).await
         })?,
     )?;
 
     // postgresql.open(url) - Open with URL string (alias)
     module.set(
         "open",
-        lua.create_function(|_, url: String| match Database::open_url(&url) {
-            Ok(db) => Ok(db),
-            Err(e) => Err(mlua::Error::external(e)),
+        lua.create_async_function(|_, url: String| async move {
+            connect_blocking(ConnectTarget::Url(url)).await
         })?,
     )?;
 

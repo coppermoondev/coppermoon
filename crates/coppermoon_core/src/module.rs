@@ -80,8 +80,9 @@ pub fn setup_loader(lua: &Lua, base_path: &Path) -> Result<()> {
                 let code = std::fs::read_to_string(&path)
                     .map_err(|e| mlua::Error::runtime(format!("Failed to read module: {}", e)))?;
 
+                // `@` prefix: display as a file name in error tracebacks.
                 let chunk = lua.load(&code)
-                    .set_name(path.to_string_lossy());
+                    .set_name(format!("@{}", path.display()));
 
                 let loader: Function = chunk.into_function()?;
                 let path_str = path.to_string_lossy().to_string();
@@ -165,6 +166,62 @@ pub fn setup_loader(lua: &Lua, base_path: &Path) -> Result<()> {
         base_path_owned.display()
     );
     package.set("path", lua_path)?;
+
+    // Replace the C `require` with a pure-Lua implementation.
+    //
+    // Lua's built-in require is a C function: module top-level code runs
+    // across a C-call boundary and therefore cannot yield — which would
+    // forbid async runtime functions (http, time.sleep, DB queries…) at
+    // module load time. With require implemented in Lua, module chunks are
+    // called from Lua code and stay fully yieldable. Searchers (including
+    // our Rust ones) are still used unchanged: they only *locate and
+    // compile* modules, which never needs to yield.
+    lua.load(
+        r#"
+        local loading = {}
+
+        function require(name)
+            if type(name) ~= "string" then
+                error("bad argument #1 to 'require' (string expected, got "
+                    .. type(name) .. ")", 2)
+            end
+            local loaded = package.loaded[name]
+            if loaded ~= nil then
+                return loaded
+            end
+            if loading[name] then
+                error("loop or previous error loading module '" .. name .. "'", 2)
+            end
+
+            local errors = {}
+            for i = 1, #package.searchers do
+                local loader, data = package.searchers[i](name)
+                if type(loader) == "function" then
+                    loading[name] = true
+                    local ok, result = pcall(loader, name, data)
+                    loading[name] = nil
+                    if not ok then
+                        error(result, 0)
+                    end
+                    if result == nil then
+                        -- The module may have populated package.loaded itself.
+                        result = package.loaded[name]
+                        if result == nil then
+                            result = true
+                        end
+                    end
+                    package.loaded[name] = result
+                    return result
+                elseif type(loader) == "string" then
+                    errors[#errors + 1] = loader
+                end
+            end
+            error("module '" .. name .. "' not found:" .. table.concat(errors), 2)
+        end
+        "#,
+    )
+    .set_name("=[coppermoon require]")
+    .exec()?;
 
     Ok(())
 }

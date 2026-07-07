@@ -24,7 +24,15 @@ pub fn register(lua: &Lua) -> Result<()> {
     Ok(())
 }
 
+/// Maximum table nesting displayed by `print` — deeper levels (or cycles)
+/// are rendered as `{...}` instead of overflowing the stack.
+const MAX_PRINT_DEPTH: usize = 16;
+
 fn format_value(value: &mlua::Value) -> String {
+    format_value_depth(value, 0)
+}
+
+fn format_value_depth(value: &mlua::Value, depth: usize) -> String {
     match value {
         mlua::Value::Nil => "nil".to_string(),
         mlua::Value::Boolean(b) => b.to_string(),
@@ -42,7 +50,13 @@ fn format_value(value: &mlua::Value) -> String {
                 Err(_) => "<invalid utf8>".to_string(),
             }
         }
-        mlua::Value::Table(t) => format_table(t),
+        mlua::Value::Table(t) => {
+            if depth >= MAX_PRINT_DEPTH {
+                "{...}".to_string()
+            } else {
+                format_table(t, depth)
+            }
+        }
         mlua::Value::Function(_) => "function".to_string(),
         mlua::Value::Thread(_) => "thread".to_string(),
         mlua::Value::UserData(_) => "userdata".to_string(),
@@ -52,7 +66,7 @@ fn format_value(value: &mlua::Value) -> String {
     }
 }
 
-fn format_table(table: &mlua::Table) -> String {
+fn format_table(table: &mlua::Table, depth: usize) -> String {
     let mut parts = Vec::new();
     let mut is_array = true;
     let mut index = 1i64;
@@ -76,7 +90,7 @@ fn format_table(table: &mlua::Table) -> String {
     for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
         if let Ok((key, value)) = pair {
             if is_array {
-                parts.push(format_value(&value));
+                parts.push(format_value_depth(&value, depth + 1));
             } else {
                 let key_str = match &key {
                     mlua::Value::String(s) => {
@@ -85,9 +99,9 @@ fn format_table(table: &mlua::Table) -> String {
                             Err(_) => "?".to_string(),
                         }
                     }
-                    _ => format_value(&key),
+                    _ => format_value_depth(&key, depth + 1),
                 };
-                parts.push(format!("{} = {}", key_str, format_value(&value)));
+                parts.push(format!("{} = {}", key_str, format_value_depth(&value, depth + 1)));
             }
         }
     }

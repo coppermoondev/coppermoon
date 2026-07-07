@@ -34,7 +34,7 @@ hex = "0.4"
 crossterm = "0.28"
 
 # For http module
-reqwest = { version = "0.12", features = ["blocking", "json", "cookies"] }
+reqwest = { version = "0.12", features = ["json", "cookies"] }
 
 # For websocket module
 tungstenite = { version = "0.26", features = ["native-tls"] }

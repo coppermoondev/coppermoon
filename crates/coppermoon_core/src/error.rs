@@ -5,7 +5,9 @@ use thiserror::Error;
 /// Main error type for CopperMoon operations
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Lua error: {0}")]
+    // mlua errors already carry full context ("runtime error: ...\nstack
+    // traceback: ..."), so no extra prefix.
+    #[error("{0}")]
     Lua(#[from] mlua::Error),
 
     #[error("IO error: {0}")]

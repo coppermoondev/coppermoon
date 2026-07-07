@@ -13,6 +13,32 @@ pub fn register(lua: &Lua) -> Result<Table> {
     // process.exit(code)
     process_table.set("exit", lua.create_function(process_exit)?)?;
 
+    // process.shutdown() — request a graceful shutdown: the HTTP server
+    // drains in-flight requests, the event loop exits, the process ends
+    // cleanly. Same path as Ctrl+C / SIGTERM.
+    process_table.set("shutdown", lua.create_function(|_, ()| {
+        coppermoon_core::shutdown::request();
+        Ok(())
+    })?)?;
+
+    // process.on_error(fn | nil) — install/clear the uncaught-error hook.
+    // Called with (message, context) for errors raised by background
+    // callbacks (HTTP handlers, timers). Default policy: log + continue.
+    process_table.set("on_error", lua.create_function(
+        |lua, func: Option<mlua::Function>| {
+            coppermoon_core::uncaught::set_handler(lua, func)
+        },
+    )?)?;
+
+    // process.memory() -> { used, limit } — Lua VM memory usage in bytes
+    // (limit is 0 when COPPERMOON_MEMORY_LIMIT is not set).
+    process_table.set("memory", lua.create_function(|lua, ()| {
+        let t = lua.create_table()?;
+        t.set("used", lua.used_memory())?;
+        t.set("limit", coppermoon_core::runtime::memory_limit())?;
+        Ok(t)
+    })?)?;
+
     // process.pid() -> number
     process_table.set("pid", lua.create_function(process_pid)?)?;
 

@@ -25,7 +25,34 @@ pub mod datetime;
 pub mod regex;
 
 use coppermoon_core::Result;
-use mlua::{Lua, Table};
+use mlua::{Function, Lua, Table};
+
+/// Build a *hybrid* Lua function that dispatches between an async and a
+/// synchronous implementation of the same operation.
+///
+/// Async Lua functions can only suspend when the current coroutine is
+/// yieldable; calling one across a Lua C-call boundary (module top-level code
+/// inside `require`, metamethods, `table.sort` comparators, …) raises
+/// "attempt to yield across a C-call boundary". The returned function checks
+/// `coroutine.isyieldable()` at call time: in yieldable contexts it takes the
+/// async path (the event loop keeps running during the operation), otherwise
+/// it falls back to the blocking implementation (identical result, event loop
+/// paused — the pre-async behaviour).
+pub(crate) fn hybrid_fn(lua: &Lua, async_fn: Function, sync_fn: Function) -> mlua::Result<Function> {
+    lua.load(
+        r#"
+        local async_fn, sync_fn = ...
+        return function(...)
+            if coroutine.isyieldable() then
+                return async_fn(...)
+            end
+            return sync_fn(...)
+        end
+        "#,
+    )
+    .set_name("=[coppermoon hybrid dispatch]")
+    .call((async_fn, sync_fn))
+}
 
 /// Register all standard library modules in the Lua state
 pub fn register_all(lua: &Lua) -> Result<()> {

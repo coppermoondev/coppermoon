@@ -40,8 +40,21 @@ fn json_decode(lua: &Lua, json_str: String) -> mlua::Result<Value> {
     json_to_lua(lua, &json_value)
 }
 
+/// Maximum nesting depth for encoding — guards against cyclic tables,
+/// which would otherwise overflow the stack and abort the process.
+const MAX_ENCODE_DEPTH: usize = 128;
+
 /// Convert a Lua value to a JSON value
 fn lua_to_json(value: &Value) -> mlua::Result<JsonValue> {
+    lua_to_json_depth(value, 0)
+}
+
+fn lua_to_json_depth(value: &Value, depth: usize) -> mlua::Result<JsonValue> {
+    if depth > MAX_ENCODE_DEPTH {
+        return Err(mlua::Error::runtime(
+            "json.encode: maximum nesting depth exceeded (cyclic table?)",
+        ));
+    }
     match value {
         Value::Nil => Ok(JsonValue::Null),
         Value::Boolean(b) => Ok(JsonValue::Bool(*b)),
@@ -82,7 +95,7 @@ fn lua_to_json(value: &Value) -> mlua::Result<JsonValue> {
                 let mut arr = Vec::with_capacity(max_index as usize);
                 for i in 1..=max_index {
                     let val: Value = t.get(i)?;
-                    arr.push(lua_to_json(&val)?);
+                    arr.push(lua_to_json_depth(&val, depth + 1)?);
                 }
                 Ok(JsonValue::Array(arr))
             } else {
@@ -98,7 +111,7 @@ fn lua_to_json(value: &Value) -> mlua::Result<JsonValue> {
                             Value::Number(n) => n.to_string(),
                             _ => return Err(mlua::Error::runtime("JSON keys must be strings or numbers")),
                         };
-                        obj.insert(key_str, lua_to_json(&val)?);
+                        obj.insert(key_str, lua_to_json_depth(&val, depth + 1)?);
                     }
                 }
                 Ok(JsonValue::Object(obj))

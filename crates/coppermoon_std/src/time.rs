@@ -14,8 +14,21 @@ use chrono::{DateTime, Utc, NaiveDateTime};
 pub fn register(lua: &Lua) -> Result<Table> {
     let time_table = lua.create_table()?;
 
-    // time.sleep(ms) — Sleep for milliseconds
-    time_table.set("sleep", lua.create_function(time_sleep)?)?;
+    // time.sleep(ms) — Sleep for milliseconds.
+    // Async when possible: while a Lua coroutine is sleeping, the event loop
+    // keeps running (other HTTP handlers, timers, …). From Lua's perspective
+    // the call is still synchronous. In non-yieldable contexts (module
+    // top-level inside require, metamethods, …) it falls back to a blocking
+    // sleep.
+    let sleep_async = lua.create_async_function(|_, ms: u64| async move {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(())
+    })?;
+    let sleep_sync = lua.create_function(|_, ms: u64| {
+        coppermoon_core::async_runtime::sleep_blocking(ms);
+        Ok(())
+    })?;
+    time_table.set("sleep", crate::hybrid_fn(lua, sleep_async, sleep_sync)?)?;
 
     // time.now() — Current Unix timestamp in seconds
     time_table.set("now", lua.create_function(time_now)?)?;
@@ -57,11 +70,6 @@ pub fn register_globals(lua: &Lua) -> Result<()> {
     // clearInterval(timer_id) - alias for clearTimeout
     globals.set("clearInterval", lua.create_function(clear_timeout)?)?;
 
-    Ok(())
-}
-
-fn time_sleep(_: &Lua, ms: u64) -> mlua::Result<()> {
-    coppermoon_core::async_runtime::sleep_blocking(ms);
     Ok(())
 }
 

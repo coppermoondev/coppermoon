@@ -9,6 +9,7 @@ description = "Core runtime engine for CopperMoon"
 [dependencies]
 mlua.workspace = true
 tokio.workspace = true
+futures-executor = "0.3"
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

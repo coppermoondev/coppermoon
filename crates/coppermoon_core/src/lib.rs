@@ -8,7 +8,9 @@ pub mod runtime;
 pub mod module;
 pub mod async_runtime;
 pub mod event_loop;
+pub mod shutdown;
+pub mod uncaught;
 
 pub use error::{Error, Result};
 pub use runtime::Runtime;
-pub use async_runtime::{block_on, spawn, get_runtime};
+pub use async_runtime::{block_on, run_local, spawn, get_runtime};

@@ -9,6 +9,7 @@ description = "SQLite bindings for CopperMoon Lua runtime"
 [dependencies]
 mlua.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 # SQLite
 rusqlite = { version = "0.32", features = ["bundled"] }

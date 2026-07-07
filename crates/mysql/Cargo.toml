@@ -9,6 +9,7 @@ description = "MySQL/MariaDB bindings for CopperMoon Lua runtime"
 [dependencies]
 mlua.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 # MySQL driver
 mysql = "25.0"

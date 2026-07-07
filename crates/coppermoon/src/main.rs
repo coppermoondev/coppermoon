@@ -92,7 +92,11 @@ fn run_file(file: &str, args: Vec<String>) -> Result<()> {
 
     // Execute the file (just the filename, base_path is already set)
     if let Err(e) = runtime.exec_file(file_name) {
-        eprintln!("{}: {}", "error".red().bold(), e);
+        // mlua messages start with "runtime error: " — drop the redundant
+        // prefix, the traceback that follows is kept as-is.
+        let msg = e.to_string();
+        let msg = msg.strip_prefix("runtime error: ").unwrap_or(&msg);
+        eprintln!("{}: {}", "error".red().bold(), msg);
         std::process::exit(1);
     }
 

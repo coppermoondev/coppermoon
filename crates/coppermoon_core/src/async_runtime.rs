@@ -24,6 +24,29 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     get_runtime().block_on(future)
 }
 
+/// Run a future to completion on the current thread while driving a Tokio
+/// [`LocalSet`](tokio::task::LocalSet), without entering Tokio's blocking guard.
+///
+/// This is the entry point of the CopperMoon event loop: the future (usually
+/// Lua chunk execution via `exec_async`) is polled on the calling thread by a
+/// lightweight executor, and `tokio::task::spawn_local` tasks (timer callbacks,
+/// HTTP request handlers) are interleaved with it whenever it suspends on an
+/// `await`. Actual I/O and timers are driven by the global multi-threaded
+/// Tokio runtime's worker threads.
+///
+/// Because the calling thread never enters Tokio's `block_on`, synchronous
+/// stdlib functions that call [`block_on`] internally — as well as embedded
+/// libraries that create their own Tokio runtime (e.g. the `postgres` crate) —
+/// keep working when invoked from Lua code running inside this loop. They
+/// simply pause the event loop for their duration, exactly like before.
+pub fn run_local<F: Future>(future: F) -> F::Output {
+    // Make the runtime handle ambient so Tokio I/O objects, timers and
+    // `spawn` work from within the future.
+    let _guard = get_runtime().enter();
+    let local = tokio::task::LocalSet::new();
+    futures_executor::block_on(local.run_until(future))
+}
+
 /// Spawn a task on the Tokio runtime
 pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where

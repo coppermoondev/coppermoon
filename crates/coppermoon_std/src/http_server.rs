@@ -1,14 +1,17 @@
 //! HTTP Server module for CopperMoon
 //!
 //! Provides an HTTP server with concurrent connection handling.
-//! Connections are accepted and I/O is performed asynchronously on Tokio
-//! worker threads, while Lua handler execution is serialised on the main
-//! thread (Node.js-style event loop).
+//! Connections are accepted and socket I/O is performed asynchronously on
+//! Tokio worker threads. Each request is dispatched to its Lua handler as a
+//! task on the event-loop `LocalSet` (Node.js-style): handlers run
+//! interleaved on the main thread, so while one handler awaits an async
+//! operation (http client, time.sleep, DB…), other requests keep being
+//! served.
 
 use coppermoon_core::Result;
-use coppermoon_core::event_loop;
 use mlua::{Lua, Table, Function, Value, RegistryKey};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
@@ -20,7 +23,69 @@ const MAX_REQUEST_LINE: usize = 8 * 1024;       // 8 KB
 const MAX_HEADER_LINE: usize = 8 * 1024;        // 8 KB per header
 const MAX_HEADER_COUNT: usize = 100;             // max number of headers
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;  // 10 MB
-const CONNECTION_TIMEOUT_SECS: u64 = 30;         // 30s idle timeout
+const CONNECTION_TIMEOUT_SECS: u64 = 30;         // 30s idle / per-request timeout
+const MAX_REQUESTS_PER_CONNECTION: usize = 1000; // keep-alive requests per connection
+const SHUTDOWN_GRACE_SECS: u64 = 10;             // drain deadline on graceful shutdown
+const MAX_JSON_DEPTH: usize = 128;               // nesting guard (cyclic tables)
+
+/// Backpressure limits, overridable via environment variables.
+const DEFAULT_MAX_IN_FLIGHT: usize = 1024;       // concurrent Lua handlers
+const DEFAULT_MAX_CONNECTIONS: usize = 10_240;   // concurrent TCP connections
+
+fn env_limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn max_in_flight() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("COPPERMOON_MAX_IN_FLIGHT", DEFAULT_MAX_IN_FLIGHT))
+}
+
+fn max_connections() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_limit("COPPERMOON_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS))
+}
+
+// ---------------------------------------------------------------------------
+// Server-wide statistics (shared by every listener in the process)
+// ---------------------------------------------------------------------------
+
+mod stats {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    pub static REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    /// Responses by status class: [1xx, 2xx, 3xx, 4xx, 5xx].
+    pub static STATUS_CLASSES: [AtomicU64; 5] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+
+    pub fn mark_started() {
+        let _ = STARTED.set(Instant::now());
+    }
+
+    pub fn uptime_seconds() -> u64 {
+        STARTED.get().map(|s| s.elapsed().as_secs()).unwrap_or(0)
+    }
+
+    pub fn record_response(status: u16) {
+        let class = usize::from((status / 100).clamp(1, 5)) - 1;
+        STATUS_CLASSES[class].fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Plain-data types that cross the channel boundary (no Lua objects)
@@ -32,6 +97,8 @@ struct ParsedRequest {
     query_string: Option<String>,
     headers: HashMap<String, String>,
     body: String,
+    /// Whether the client allows connection reuse (HTTP/1.1 semantics).
+    keep_alive: bool,
 }
 
 struct HttpResponse {
@@ -52,6 +119,24 @@ type RequestMessage = (ParsedRequest, tokio::sync::oneshot::Sender<HttpResponse>
 pub fn register(lua: &Lua) -> Result<Table> {
     let server_table = lua.create_table()?;
     server_table.set("new", lua.create_function(server_new)?)?;
+
+    // http.server.stats() -> counters for monitoring / health endpoints.
+    server_table.set("stats", lua.create_function(|lua, ()| {
+        use std::sync::atomic::Ordering;
+        let t = lua.create_table()?;
+        t.set("requests_total", stats::REQUESTS_TOTAL.load(Ordering::Relaxed))?;
+        t.set("rejected_total", stats::REJECTED_TOTAL.load(Ordering::Relaxed))?;
+        t.set("in_flight", stats::IN_FLIGHT.load(Ordering::Relaxed))?;
+        t.set("uptime_seconds", stats::uptime_seconds())?;
+        for (i, name) in ["status_1xx", "status_2xx", "status_3xx", "status_4xx", "status_5xx"]
+            .iter()
+            .enumerate()
+        {
+            t.set(*name, stats::STATUS_CLASSES[i].load(Ordering::Relaxed))?;
+        }
+        Ok(t)
+    })?)?;
+
     Ok(server_table)
 }
 
@@ -111,17 +196,39 @@ fn server_new(lua: &Lua, _: ()) -> mlua::Result<Table> {
         Ok(server)
     })?)?;
 
-    server.set("listen", lua.create_function(server_listen)?)?;
+    server.set("listen", lua.create_async_function(server_listen)?)?;
 
     Ok(server)
 }
 
 // ---------------------------------------------------------------------------
-// server:listen(port, callback?)
+// server:listen(port, host?, callback?)
 // ---------------------------------------------------------------------------
 
-fn server_listen(lua: &Lua, (server, port, callback): (Table, u16, Option<Function>)) -> mlua::Result<()> {
+async fn server_listen(lua: Lua, (server, port, rest): (Table, u16, mlua::MultiValue)) -> mlua::Result<()> {
     server.set("_port", port)?;
+
+    // Flexible trailing arguments: an optional host string and an optional
+    // callback function, in any order. Fallback: COPPERMOON_HOST env var,
+    // then loopback (safe default; use "0.0.0.0" to expose, e.g. in Docker).
+    let mut host: Option<String> = None;
+    let mut callback: Option<Function> = None;
+    for value in rest {
+        match value {
+            Value::String(s) => host = Some(s.to_str()?.to_string()),
+            Value::Function(f) => callback = Some(f),
+            Value::Nil => {}
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "listen: unexpected argument of type {}",
+                    other.type_name()
+                )));
+            }
+        }
+    }
+    let host = host
+        .or_else(|| std::env::var("COPPERMOON_HOST").ok().filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
     let routes: Table = server.get("_routes")?;
 
@@ -132,60 +239,131 @@ fn server_listen(lua: &Lua, (server, port, callback): (Table, u16, Option<Functi
         let reg_key = lua.create_registry_value(handler)?;
         route_handlers.insert(key, reg_key);
     }
+    // Shared with the per-request dispatch tasks.
+    let route_handlers = Arc::new(route_handlers);
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("{}:{}", host, port);
 
-    // Create a std::sync::mpsc channel for request dispatch.
-    // The main Lua thread receives on this channel (blocking, NOT inside
-    // a Tokio context) so that Lua handlers can freely call block_on().
-    let (tx, rx) = std::sync::mpsc::channel::<RequestMessage>();
+    // Channel carrying parsed requests from Tokio connection tasks to the
+    // Lua event loop.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RequestMessage>();
 
-    // Spawn the async accept loop on the Tokio runtime.
-    let addr_clone = addr.clone();
+    // Bind before spawning the accept loop so that a bind failure is
+    // reported synchronously to the caller instead of a background eprintln.
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| mlua::Error::runtime(format!("Failed to bind to {}: {}", addr, e)))?;
+
+    // Spawn the async accept loop on the Tokio runtime. It stops (and the
+    // listener closes) as soon as a graceful shutdown is requested.
+    // A semaphore caps concurrent connections: beyond the limit, clients
+    // get an immediate 503 instead of an ever-growing task pile.
+    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(max_connections()));
     coppermoon_core::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(&addr_clone).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Failed to bind to {}: {}", addr_clone, e);
-                return;
-            }
-        };
-
         loop {
-            match listener.accept().await {
-                Ok((stream, _peer)) => {
-                    let tx = tx.clone();
-                    tokio::spawn(handle_connection(stream, tx));
-                }
-                Err(e) => {
-                    eprintln!("Accept error: {}", e);
-                }
+            tokio::select! {
+                _ = coppermoon_core::shutdown::requested() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((mut stream, _peer)) => {
+                        match conn_limiter.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit; // released when the connection ends
+                                    handle_connection(stream, tx).await;
+                                });
+                            }
+                            Err(_) => {
+                                stats::REJECTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                stats::record_response(503);
+                                tokio::spawn(async move {
+                                    let resp = build_response_bytes(
+                                        503,
+                                        "text/plain",
+                                        "Service Unavailable (connection limit reached)",
+                                        &[],
+                                    );
+                                    let _ = stream.write_all(&resp).await;
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Accept error: {}", e);
+                    }
+                },
             }
         }
+        // Listener dropped here: no new connections are accepted.
     });
 
     // Notify callback if provided
     if let Some(cb) = callback {
-        cb.call::<()>(port)?;
+        cb.call_async::<()>(port).await?;
     }
 
     println!("CopperMoon server listening on http://{}", addr);
 
-    // ---------- Main Lua event loop ----------
-    // We use recv_timeout so we can also drain pending timers.
+    // ---------- Request dispatch loop ----------
+    // Each request is dispatched as its own task on the event-loop
+    // `LocalSet`. Handlers therefore run concurrently (interleaved on the
+    // main thread): while one awaits an async operation, others progress.
+    // Timers are fired by the runtime's global timer pump — no special
+    // handling needed here.
+    stats::mark_started();
     loop {
-        // Process any ready timer callbacks between requests.
-        drain_timers(lua);
+        tokio::select! {
+            _ = coppermoon_core::shutdown::requested() => break,
+            msg = rx.recv() => match msg {
+                Some((request, resp_tx)) => {
+                    use std::sync::atomic::Ordering;
+                    stats::REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-        match rx.recv_timeout(Duration::from_millis(10)) {
-            Ok((request, resp_tx)) => {
-                let response = dispatch_to_lua(lua, &request, &route_handlers);
-                // Ignore send error — the connection task may have dropped.
-                let _ = resp_tx.send(response);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    // Backpressure: past the in-flight cap, shed load with
+                    // an immediate 503 instead of queueing without bound.
+                    if stats::IN_FLIGHT.load(Ordering::SeqCst) >= max_in_flight() {
+                        stats::REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        stats::record_response(503);
+                        let _ = resp_tx.send(HttpResponse {
+                            status: 503,
+                            content_type: "text/plain".into(),
+                            body: b"Service Unavailable (overloaded)".to_vec(),
+                            headers: vec![("Retry-After".to_string(), "1".to_string())],
+                        });
+                        continue;
+                    }
+
+                    let lua = lua.clone();
+                    let handlers = route_handlers.clone();
+                    stats::IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::spawn_local(async move {
+                        let response = dispatch_to_lua(&lua, &request, &handlers).await;
+                        stats::record_response(response.status);
+                        // Ignore send error — the connection task may have dropped.
+                        let _ = resp_tx.send(response);
+                        stats::IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+                None => break,
+            },
         }
+    }
+
+    // ---------- Graceful drain ----------
+    // Wait for in-flight handlers to finish, up to a grace deadline.
+    let pending = stats::IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst);
+    if pending > 0 {
+        println!("Shutting down: waiting for {} in-flight request(s)...", pending);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(SHUTDOWN_GRACE_SECS);
+    while stats::IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let leftover = stats::IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst);
+    if leftover > 0 {
+        eprintln!("Shutdown grace period expired with {} request(s) still running", leftover);
     }
 
     Ok(())
@@ -197,7 +375,7 @@ fn server_listen(lua: &Lua, (server, port, callback): (Table, u16, Option<Functi
 
 async fn handle_connection(
     stream: tokio::net::TcpStream,
-    tx: std::sync::mpsc::Sender<RequestMessage>,
+    tx: tokio::sync::mpsc::UnboundedSender<RequestMessage>,
 ) {
     if let Err(e) = handle_connection_inner(stream, tx).await {
         eprintln!("Connection error: {}", e);
@@ -227,79 +405,123 @@ async fn read_limited_line(
 
 async fn handle_connection_inner(
     mut stream: tokio::net::TcpStream,
-    tx: std::sync::mpsc::Sender<RequestMessage>,
+    tx: tokio::sync::mpsc::UnboundedSender<RequestMessage>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.split();
     let mut reader = tokio::io::BufReader::new(reader);
 
-    // Apply connection timeout to the entire request parsing phase.
-    let result = tokio::time::timeout(
-        Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-        parse_request(&mut reader),
-    )
-    .await;
+    // HTTP/1.1 keep-alive: serve multiple requests on the same connection.
+    let mut served: usize = 0;
+    loop {
+        // Timeout covers both the idle wait for the next request and the
+        // parsing of a request in progress.
+        let result = tokio::time::timeout(
+            Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+            parse_request(&mut reader),
+        )
+        .await;
 
-    let request = match result {
-        Ok(Ok(req)) => req,
-        Ok(Err(e)) => {
-            // Parse error — determine appropriate status code
-            let err_msg = e.to_string();
-            let (status, msg) = if err_msg.contains("line too long") {
-                (414u16, "URI Too Long")
-            } else if err_msg.contains("Header too long") {
-                (431u16, "Request Header Fields Too Large")
-            } else if err_msg.contains("Too many headers") {
-                (431u16, "Request Header Fields Too Large")
-            } else if err_msg.contains("Body too large") {
-                (413u16, "Payload Too Large")
-            } else {
-                (400u16, "Bad Request")
-            };
-            let resp = build_response_bytes(status as u16, "text/plain", msg, &[]);
+        let request = match result {
+            // Client closed the connection cleanly.
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(req))) => req,
+            Ok(Err(e)) => {
+                // Parse error — determine appropriate status code
+                let err_msg = e.to_string();
+                let (status, msg) = if err_msg.contains("line too long") {
+                    (414u16, "URI Too Long")
+                } else if err_msg.contains("Header too long") {
+                    (431u16, "Request Header Fields Too Large")
+                } else if err_msg.contains("Too many headers") {
+                    (431u16, "Request Header Fields Too Large")
+                } else if err_msg.contains("Body too large") {
+                    (413u16, "Payload Too Large")
+                } else {
+                    (400u16, "Bad Request")
+                };
+                let resp = build_response_bytes(status, "text/plain", msg, &[]);
+                writer.write_all(&resp).await.ok();
+                return Ok(());
+            }
+            Err(_timeout) => {
+                // Only answer 408 if the timeout hit the *first* request;
+                // an idle keep-alive connection is simply closed.
+                if served == 0 {
+                    let resp = build_response_bytes(408, "text/plain", "Request Timeout", &[]);
+                    writer.write_all(&resp).await.ok();
+                }
+                return Ok(());
+            }
+        };
+
+        served += 1;
+
+        // Send to the Lua event loop and wait for the response.
+        let is_head = request.method == "HEAD";
+        let client_keep_alive = request.keep_alive;
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        if tx.send((request, resp_tx)).is_err() {
+            // Dispatch loop is gone (shutdown).
+            let resp = build_response_bytes(503, "text/plain", "Service Unavailable", &[]);
             writer.write_all(&resp).await.ok();
             return Ok(());
         }
-        Err(_timeout) => {
-            let resp = build_response_bytes(408, "text/plain", "Request Timeout", &[]);
-            writer.write_all(&resp).await.ok();
-            return Ok(());
-        }
-    };
 
-    // Send to main Lua thread and wait for response.
-    let is_head = request.method == "HEAD";
-    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    tx.send((request, resp_tx))?;
+        match resp_rx.await {
+            Ok(response) => {
+                // Reuse the connection unless the client refused, the
+                // per-connection cap is reached, or we are shutting down.
+                let keep_alive = client_keep_alive
+                    && served < MAX_REQUESTS_PER_CONNECTION
+                    && !coppermoon_core::shutdown::is_requested();
 
-    match resp_rx.await {
-        Ok(response) => {
-            let bytes = build_response_bytes_ex(
-                response.status,
-                &response.content_type,
-                &response.body,
-                &response.headers,
-                is_head,
-            );
-            writer.write_all(&bytes).await.ok();
-            writer.flush().await.ok();
-        }
-        Err(_) => {
-            let bytes = build_response_bytes(500, "text/plain", "Internal Server Error", &[]);
-            writer.write_all(&bytes).await.ok();
+                let bytes = build_response_bytes_ex(
+                    response.status,
+                    &response.content_type,
+                    &response.body,
+                    &response.headers,
+                    is_head,
+                    keep_alive,
+                );
+                writer.write_all(&bytes).await.ok();
+                writer.flush().await.ok();
+
+                if !keep_alive {
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                // The dispatch task was dropped: happens when a graceful
+                // shutdown discards queued requests.
+                let (status, msg) = if coppermoon_core::shutdown::is_requested() {
+                    (503, "Service Unavailable")
+                } else {
+                    (500, "Internal Server Error")
+                };
+                let bytes = build_response_bytes(status, "text/plain", msg, &[]);
+                writer.write_all(&bytes).await.ok();
+                return Ok(());
+            }
         }
     }
-
-    Ok(())
 }
 
 /// Parse an HTTP request with enforced size limits.
+///
+/// Returns `Ok(None)` when the client closed the connection cleanly before
+/// sending a request (normal end of a keep-alive connection).
 async fn parse_request(
     reader: &mut tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
-) -> std::result::Result<ParsedRequest, Box<dyn std::error::Error + Send + Sync>> {
+) -> std::result::Result<Option<ParsedRequest>, Box<dyn std::error::Error + Send + Sync>> {
     // --- Parse request line (bounded) ---
     let request_line = read_limited_line(reader, MAX_REQUEST_LINE)
         .await?
         .ok_or("Request line too long")?;
+
+    // EOF before any byte of a new request: clean close.
+    if request_line.is_empty() {
+        return Ok(None);
+    }
 
     let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
     if parts.len() < 2 {
@@ -308,6 +530,9 @@ async fn parse_request(
 
     let method = parts[0].to_uppercase();
     let full_path = parts[1].to_string();
+    // HTTP/0.9 has no version token; treat anything unknown as HTTP/1.0
+    // (keep-alive only when explicitly requested).
+    let is_http11 = parts.get(2).is_some_and(|v| v.eq_ignore_ascii_case("HTTP/1.1"));
 
     let (path, query_string) = if let Some(pos) = full_path.find('?') {
         (full_path[..pos].to_string(), Some(full_path[pos + 1..].to_string()))
@@ -318,6 +543,7 @@ async fn parse_request(
     // --- Parse headers (bounded count and size) ---
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut content_length: usize = 0;
+    let mut chunked = false;
 
     for _ in 0..MAX_HEADER_COUNT + 1 {
         let line = read_limited_line(reader, MAX_HEADER_LINE)
@@ -337,13 +563,33 @@ async fn parse_request(
             let value = value.trim().to_string();
             if key == "content-length" {
                 content_length = value.parse().unwrap_or(0);
+            } else if key == "transfer-encoding"
+                && value.to_lowercase().contains("chunked")
+            {
+                chunked = true;
             }
             headers.insert(key, value);
         }
     }
 
+    // Connection semantics: HTTP/1.1 defaults to keep-alive, HTTP/1.0 to
+    // close, both overridable by the Connection header.
+    let connection = headers
+        .get("connection")
+        .map(|v| v.to_lowercase())
+        .unwrap_or_default();
+    let keep_alive = if is_http11 {
+        connection != "close"
+    } else {
+        connection == "keep-alive"
+    };
+
     // --- Read body (bounded) ---
-    let body = if content_length > 0 {
+    // Per RFC 7230 §3.3.3, Transfer-Encoding takes precedence over
+    // Content-Length.
+    let body = if chunked {
+        read_chunked_body(reader).await?
+    } else if content_length > 0 {
         if content_length > MAX_BODY_SIZE {
             return Err("Body too large".into());
         }
@@ -354,22 +600,75 @@ async fn parse_request(
         String::new()
     };
 
-    Ok(ParsedRequest { method, path, query_string, headers, body })
+    Ok(Some(ParsedRequest { method, path, query_string, headers, body, keep_alive }))
+}
+
+/// Decode a `Transfer-Encoding: chunked` request body (RFC 7230 §4.1),
+/// enforcing the same total size limit as Content-Length bodies.
+async fn read_chunked_body(
+    reader: &mut tokio::io::BufReader<tokio::net::tcp::ReadHalf<'_>>,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut body: Vec<u8> = Vec::new();
+
+    loop {
+        // Chunk size line: hex size, optionally followed by ";extensions".
+        let size_line = read_limited_line(reader, MAX_HEADER_LINE)
+            .await?
+            .ok_or("Chunk size line too long")?;
+        let size_str = size_line
+            .trim()
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| format!("Invalid chunk size: '{}'", size_str))?;
+
+        if body.len() + size > MAX_BODY_SIZE {
+            return Err("Body too large".into());
+        }
+
+        if size == 0 {
+            // Trailer section: read (and discard) until the empty line.
+            for _ in 0..MAX_HEADER_COUNT + 1 {
+                let line = read_limited_line(reader, MAX_HEADER_LINE)
+                    .await?
+                    .ok_or("Trailer line too long")?;
+                if line.trim().is_empty() {
+                    return Ok(String::from_utf8_lossy(&body).to_string());
+                }
+            }
+            return Err("Too many trailer lines".into());
+        }
+
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader.read_exact(&mut body[start..]).await?;
+
+        // Chunk data is followed by CRLF.
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf).await?;
+        if &crlf != b"\r\n" {
+            return Err("Malformed chunk terminator".into());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Lua handler dispatch (runs on the main thread)
+// Lua handler dispatch (runs as a task on the event-loop LocalSet)
 // ---------------------------------------------------------------------------
 
-fn dispatch_to_lua(
+async fn dispatch_to_lua(
     lua: &Lua,
     request: &ParsedRequest,
     route_handlers: &HashMap<String, RegistryKey>,
 ) -> HttpResponse {
-    match dispatch_to_lua_inner(lua, request, route_handlers) {
+    match dispatch_to_lua_inner(lua, request, route_handlers).await {
         Ok(resp) => resp,
         Err(e) => {
-            eprintln!("Handler error: {}", e);
+            // Route through the uncaught-error policy (process.on_error
+            // hook, or default log). The request itself gets a 500.
+            coppermoon_core::uncaught::report(lua, "http handler", &e).await;
             HttpResponse {
                 status: 500,
                 content_type: "text/plain".into(),
@@ -380,7 +679,7 @@ fn dispatch_to_lua(
     }
 }
 
-fn dispatch_to_lua_inner(
+async fn dispatch_to_lua_inner(
     lua: &Lua,
     request: &ParsedRequest,
     route_handlers: &HashMap<String, RegistryKey>,
@@ -473,9 +772,10 @@ fn dispatch_to_lua_inner(
         Ok(ctx)
     })?)?;
 
-    // Call the handler
+    // Call the handler on its own Lua coroutine: the call suspends whenever
+    // the handler performs an async operation, letting other requests run.
     let handler: Function = lua.registry_value(reg_key)?;
-    let result = handler.call::<Value>(ctx.clone())?;
+    let result = handler.call_async::<Value>(ctx.clone()).await?;
 
     let status: u16 = ctx.get("_status").unwrap_or(200);
     let content_type: String = ctx.get("_content_type").unwrap_or_else(|_| "text/plain".to_string());
@@ -506,38 +806,6 @@ fn dispatch_to_lua_inner(
     }
 
     Ok(HttpResponse { status, content_type, body, headers: extra_headers })
-}
-
-// ---------------------------------------------------------------------------
-// Timer integration
-// ---------------------------------------------------------------------------
-
-/// Drain all ready timer events and execute their Lua callbacks.
-fn drain_timers(lua: &Lua) {
-    use coppermoon_core::event_loop::{TimerEvent, TimerType};
-
-    while let Some(event) = event_loop::try_recv_timer_event(Duration::from_millis(0)) {
-        match event {
-            TimerEvent::Ready(id) => {
-                if let Some(cb) = event_loop::take_timer_callback(id) {
-                    let func: mlua::Result<Function> = lua.registry_value(&cb.registry_key);
-                    if let Ok(func) = func {
-                        if let Err(e) = func.call::<()>(()) {
-                            eprintln!("Timer callback error: {}", e);
-                        }
-                    }
-                    match cb.timer_type {
-                        TimerType::Timeout => {
-                            let _ = lua.remove_registry_value(cb.registry_key);
-                        }
-                        TimerType::Interval { .. } => {
-                            event_loop::restore_timer_callback(id, cb);
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +857,17 @@ fn escape_json_string(s: &str) -> String {
 }
 
 fn value_to_json(value: &Value) -> mlua::Result<String> {
+    value_to_json_depth(value, 0)
+}
+
+fn value_to_json_depth(value: &Value, depth: usize) -> mlua::Result<String> {
+    // Depth guard: prevents a stack overflow (= process abort) on cyclic or
+    // pathologically nested tables passed to ctx:json().
+    if depth > MAX_JSON_DEPTH {
+        return Err(mlua::Error::runtime(
+            "JSON encoding exceeds maximum nesting depth (cyclic table?)",
+        ));
+    }
     match value {
         Value::Nil => Ok("null".to_string()),
         Value::Boolean(b) => Ok(b.to_string()),
@@ -623,7 +902,7 @@ fn value_to_json(value: &Value) -> mlua::Result<String> {
                 let mut items = Vec::new();
                 for i in 1..=max_index {
                     let val: Value = t.get(i)?;
-                    items.push(value_to_json(&val)?);
+                    items.push(value_to_json_depth(&val, depth + 1)?);
                 }
                 Ok(format!("[{}]", items.join(",")))
             } else {
@@ -635,7 +914,7 @@ fn value_to_json(value: &Value) -> mlua::Result<String> {
                             Value::Integer(i) => i.to_string(),
                             _ => continue,
                         };
-                        items.push(format!("{}:{}", escape_json_string(&key_str), value_to_json(&val)?));
+                        items.push(format!("{}:{}", escape_json_string(&key_str), value_to_json_depth(&val, depth + 1)?));
                     }
                 }
                 Ok(format!("{{{}}}", items.join(",")))
@@ -645,13 +924,14 @@ fn value_to_json(value: &Value) -> mlua::Result<String> {
     }
 }
 
+/// Error/short-circuit responses always close the connection.
 fn build_response_bytes(
     status: u16,
     content_type: &str,
     body: &str,
     extra_headers: &[(String, String)],
 ) -> Vec<u8> {
-    build_response_bytes_ex(status, content_type, body.as_bytes(), extra_headers, false)
+    build_response_bytes_ex(status, content_type, body.as_bytes(), extra_headers, false, false)
 }
 
 /// Build HTTP response bytes. When `head_only` is true, Content-Length reflects
@@ -662,6 +942,7 @@ fn build_response_bytes_ex(
     body: &[u8],
     extra_headers: &[(String, String)],
     head_only: bool,
+    keep_alive: bool,
 ) -> Vec<u8> {
     let status_text = match status {
         200 => "OK",
@@ -692,11 +973,12 @@ fn build_response_bytes_ex(
     };
 
     let mut header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
         status,
         status_text,
         content_type,
         body.len(),
+        if keep_alive { "keep-alive" } else { "close" },
     );
 
     for (key, value) in extra_headers {
