@@ -99,6 +99,21 @@ UDP — `local u = net.udp.bind(host?, port)` :
 - multicast : `u:join_multicast(group, iface?)`, `u:leave_multicast(...)`,
   `u:set_multicast_loop(bool)`
 
+WebSocket (async, `wss://` supporte via TLS) :
+
+Client — `local ws = net.ws.connect(url, { headers?, timeout? })` :
+- `ws:send(data, "text"|"binary")`, `ws:recv()` -> `{ type, data, code?, reason? }`
+  ou `nil` a la fermeture (type = text/binary/ping/pong/close)
+- `ws:ping(data?)`, `ws:pong(data?)`, `ws:close(code?, reason?)`
+- `ws:set_timeout(ms)`, `ws:peer_addr()`, `ws:local_addr()`
+- full-duplex : `recv` et `send` ne se bloquent pas mutuellement (halves separees)
+
+Serveur — `local s = net.ws.listen(host?, port)` :
+- `s:serve(function(ws, ip, port) ... end)` — accept + handshake + un handler
+  concurrent par client (le handshake d'un client lent ne bloque pas les autres)
+- `s:accept()` -> `ws, peer_ip, peer_port`
+- `s:local_addr()`
+
 Utilitaire : `net.resolve(hostname)` -> table d'IP.
 
 Exemple serveur echo :
