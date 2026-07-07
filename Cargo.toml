@@ -21,6 +21,14 @@ license = "MIT"
 repository = "https://github.com/coppermoon/coppermoon"
 description = "A high-performance Lua runtime written in Rust"
 
+# Optimized release binaries (andesite ships itself as the app runtime).
+# NOTE: no `panic = "abort"` — mlua requires unwinding across the Lua boundary.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [workspace.dependencies]
 # Lua integration
 mlua = { version = "0.10", features = ["lua54", "vendored", "async", "send", "serialize"] }
