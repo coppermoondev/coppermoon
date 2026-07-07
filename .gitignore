@@ -24,6 +24,7 @@ tmp/
 dist/
 
 # Separate repos
+/crates/andesite/
 /crates/harbor/
 /harbor-registry/
 /harbor-registry/** */

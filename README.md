@@ -18,6 +18,7 @@ CopperMoon is a complete Lua execution environment, similar to what Node.js is f
 | **[Harbor](https://github.com/coppermoondev/harbor)** | Package manager (dependency management) |
 | **[Shipyard](https://github.com/coppermoondev/shipyard)** | Toolchain (CLI, project scaffolding, build, dev server) |
 | **[HoneyMoon](https://github.com/coppermoondev/honeymoon)** | Web framework (routing, middleware, plugins) |
+| **[Andesite](https://github.com/coppermoondev/andesite)** | Native desktop apps & games (GPU UI, single-exe build) |
 
 ---
 

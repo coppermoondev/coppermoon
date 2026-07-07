@@ -23,6 +23,9 @@ Quand tu travailles sur CopperMoon:
 - `crates/harbor`: package manager
 - `crates/shipyard`: toolchain dev/build
 - `crates/quarry`: process manager/daemon
+- `crates/andesite`: apps desktop natives et jeux en Lua (UI GPU egui pilotee
+  par Lua en mode immediat, `andesite new/dev/build`, exe autonome a payload
+  embarque) — repo separe, voir crates/andesite/README.md pour l'architecture
 - `crates/sqlite`, `crates/mysql`, `crates/postgresql`: modules DB globaux
 
 ### Ecosysteme Lua

@@ -7,6 +7,7 @@ members = [
     "crates/harbor",
     "crates/shipyard",
     "crates/quarry",
+    "crates/andesite",
     "crates/sqlite",
     "crates/mysql",
     "crates/postgresql",
